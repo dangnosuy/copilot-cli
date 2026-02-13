@@ -28,7 +28,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import socket
 import ssl
 import subprocess
@@ -499,9 +498,9 @@ class TokenInterceptor:
 
         try:
             # Mở VS Code ở temp folder (tránh load workspace nặng)
-            tmpwork = tempfile.mkdtemp(prefix="vscode_interceptor_ws_")
+            self._tmpwork = tempfile.mkdtemp(prefix="vscode_interceptor_ws_")
             proc = subprocess.Popen(
-                [code_cmd, "--new-window", tmpwork],
+                [code_cmd, "--new-window", self._tmpwork],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -519,17 +518,6 @@ class TokenInterceptor:
                 self.server_socket.close()
             except Exception:
                 pass
-
-        # Kill VS Code process (chỉ process ta mở)
-        if vscode_proc:
-            try:
-                vscode_proc.terminate()
-                vscode_proc.wait(timeout=5)
-            except Exception:
-                try:
-                    vscode_proc.kill()
-                except Exception:
-                    pass
 
         # Xóa temp certs
         if self._tmpdir and os.path.exists(self._tmpdir):
@@ -614,6 +602,7 @@ Ví dụ:
         print(f"  {C.DIM}{interceptor.copilot_token[:100]}...{C.RESET}")
 
     print(f"  {C.BOLD}{C.GREEN}{'═' * 48}{C.RESET}")
+    print(f"\n  {C.YELLOW}⚠️  Hãy đóng cửa sổ VS Code vừa mở (tab trống) thủ công.{C.RESET}")
 
     # Lưu nếu yêu cầu
     if args.save:
