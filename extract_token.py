@@ -12,8 +12,11 @@ Cơ chế:
 Yêu cầu:
   - VS Code đã đăng nhập GitHub (có GitHub Authentication)
   - Node.js + npm
-  - sqlite3 CLI
-  - GNOME Keyring (hoặc tương đương) đang unlocked
+  - Linux: GNOME Keyring / KWallet đang unlocked
+  - Windows: cùng user account đã login VS Code
+  - macOS: Keychain access
+
+Hỗ trợ: Linux, Windows, macOS
 
 Sử dụng:
   python3 extract_token.py              # Trích xuất và hiển thị token
@@ -47,57 +50,64 @@ class C:
 
 
 # ═══════════════════════════════════════════════════════════════
-# PATHS
+# PATHS (cross-platform)
 # ═══════════════════════════════════════════════════════════════
 HOME = Path.home()
-VSCODE_STATE_DB = HOME / ".config" / "Code" / "User" / "globalStorage" / "state.vscdb"
+PLATFORM = sys.platform  # 'linux', 'win32', 'darwin'
+
+def get_vscode_state_db() -> Path:
+    """Trả về path tới state.vscdb theo OS."""
+    if PLATFORM == "win32":
+        # Windows: %APPDATA%\Code\User\globalStorage\state.vscdb
+        appdata = os.environ.get("APPDATA", str(HOME / "AppData" / "Roaming"))
+        return Path(appdata) / "Code" / "User" / "globalStorage" / "state.vscdb"
+    elif PLATFORM == "darwin":
+        # macOS: ~/Library/Application Support/Code/User/globalStorage/state.vscdb
+        return HOME / "Library" / "Application Support" / "Code" / "User" / "globalStorage" / "state.vscdb"
+    else:
+        # Linux: ~/.config/Code/User/globalStorage/state.vscdb
+        return HOME / ".config" / "Code" / "User" / "globalStorage" / "state.vscdb"
+
+VSCODE_STATE_DB = get_vscode_state_db()
 ELECTRON_APP_JS = '''
 const { app, safeStorage } = require('electron');
-const { execSync } = require('child_process');
-const path = require('path');
 const os = require('os');
-const fs = require('fs');
 
-// Match VS Code's app name → uses same keyring encryption key
-app.setName('Code');
+// Linux: must match VS Code's app name to use same keyring encryption key
+// Windows: DPAPI doesn't care about app name
+// macOS: Keychain uses app signature, setName helps
+if (process.platform !== 'win32') {
+  app.setName('Code');
+}
+
 app.disableHardwareAcceleration();
 app.on('window-all-closed', () => app.quit());
 
 app.whenReady().then(() => {
   try {
-    const dbPath = process.env.VSCODE_DB_PATH || path.join(os.homedir(), '.config', 'Code', 'User', 'globalStorage', 'state.vscdb');
-
-    if (!fs.existsSync(dbPath)) {
-      process.stderr.write(JSON.stringify({error: 'state.vscdb not found', path: dbPath}) + '\\n');
-      app.exit(1);
-      return;
-    }
-
     if (!safeStorage.isEncryptionAvailable()) {
-      process.stderr.write(JSON.stringify({error: 'Encryption not available (keyring locked?)'}) + '\\n');
+      process.stderr.write(JSON.stringify({error: 'Encryption not available. Keyring/DPAPI locked?'}) + '\\n');
       app.exit(1);
       return;
     }
 
-    // Read encrypted blob from SQLite
-    const result = execSync(
-      `sqlite3 "${dbPath}" "SELECT value FROM ItemTable WHERE key LIKE 'secret://%github.auth%'"`,
-      { encoding: 'utf-8', timeout: 5000 }
-    ).trim();
-
-    if (!result) {
-      process.stderr.write(JSON.stringify({error: 'No github auth entry in database'}) + '\\n');
-      app.exit(1);
-      return;
-    }
-
-    const data = JSON.parse(result);
-    const encrypted = Buffer.from(data.data);
-    const decrypted = safeStorage.decryptString(encrypted);
-
-    // Output as JSON
-    process.stdout.write(decrypted + '\\n');
-    app.exit(0);
+    // Read encrypted buffer from stdin (sent by Python as JSON array of bytes)
+    let inputData = '';
+    process.stdin.setEncoding('utf-8');
+    process.stdin.on('data', (chunk) => { inputData += chunk; });
+    process.stdin.on('end', () => {
+      try {
+        const byteArray = JSON.parse(inputData);
+        const encrypted = Buffer.from(byteArray);
+        const decrypted = safeStorage.decryptString(encrypted);
+        process.stdout.write(decrypted + '\\n');
+        app.exit(0);
+      } catch (e) {
+        process.stderr.write(JSON.stringify({error: 'Decrypt failed: ' + e.message}) + '\\n');
+        app.exit(1);
+      }
+    });
+    process.stdin.resume();
   } catch (e) {
     process.stderr.write(JSON.stringify({error: e.message}) + '\\n');
     app.exit(1);
@@ -110,23 +120,37 @@ app.whenReady().then(() => {
 # ELECTRON SETUP
 # ═══════════════════════════════════════════════════════════════
 def find_electron() -> str | None:
-    """Tìm Electron binary."""
-    # 1. Local node_modules (cùng thư mục script)
+    """Tìm Electron binary (cross-platform)."""
     script_dir = Path(__file__).parent
-    local = script_dir / "node_modules" / ".bin" / "electron"
-    if local.exists():
-        return str(local)
 
-    # 2. Các đường dẫn khác
-    candidates = [
-        Path("/tmp/node_modules/.bin/electron"),
-        Path.home() / "node_modules" / ".bin" / "electron",
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
+    # Binary name varies by OS
+    if PLATFORM == "win32":
+        bin_names = ["electron.cmd", "electron.exe", "electron"]
+        bin_subdir = Path("node_modules") / ".bin"
+    else:
+        bin_names = ["electron"]
+        bin_subdir = Path("node_modules") / ".bin"
 
-    # 3. Global electron
+    # 1. Local node_modules (cùng thư mục script)
+    for name in bin_names:
+        local = script_dir / bin_subdir / name
+        if local.exists():
+            return str(local)
+
+    # 2. Temp location (from previous installs)
+    if PLATFORM != "win32":
+        for name in bin_names:
+            tmp = Path("/tmp") / "node_modules" / ".bin" / name
+            if tmp.exists():
+                return str(tmp)
+
+    # 3. Home directory
+    for name in bin_names:
+        home = HOME / "node_modules" / ".bin" / name
+        if home.exists():
+            return str(home)
+
+    # 4. Global electron
     electron_path = shutil.which("electron")
     if electron_path:
         return electron_path
@@ -190,13 +214,41 @@ def check_vscode_db() -> bool:
         return False
 
 
+def read_encrypted_blob() -> list[int] | None:
+    """Đọc encrypted buffer từ state.vscdb, trả về list of bytes."""
+    try:
+        conn = sqlite3.connect(str(VSCODE_STATE_DB))
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM ItemTable WHERE key LIKE 'secret://%github.auth%'"
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return None
+
+        data = json.loads(row[0])
+        # data = {"type": "Buffer", "data": [118, 49, 49, ...]}
+        return data.get("data", [])
+    except Exception:
+        return None
+
+
 def extract_token_via_electron(electron_path: str) -> dict | None:
     """Chạy Electron app để decrypt token.
+
+    Flow: Python đọc SQLite → pipe encrypted bytes qua stdin → Electron decrypt → stdout
 
     Returns:
         dict với keys: tokens (list of str), sessions (raw parsed JSON)
         hoặc None nếu lỗi
     """
+    # Đọc encrypted blob bằng Python sqlite3 (cross-platform, không cần sqlite3 CLI)
+    encrypted_bytes = read_encrypted_blob()
+    if not encrypted_bytes:
+        raise RuntimeError("Không đọc được encrypted data từ state.vscdb")
+
     # Tạo temp dir cho Electron app
     with tempfile.TemporaryDirectory(prefix="vscode_token_") as tmpdir:
         # Viết main.js
@@ -207,21 +259,19 @@ def extract_token_via_electron(electron_path: str) -> dict | None:
         pkg = Path(tmpdir) / "package.json"
         pkg.write_text('{"name":"token-extractor","main":"main.js"}')
 
-        # Chạy Electron
+        # Chạy Electron, pipe encrypted bytes qua stdin
+        cmd = [electron_path, "--no-sandbox", "--disable-gpu", tmpdir]
+        # Windows: không cần --no-sandbox
+        if PLATFORM == "win32":
+            cmd = [electron_path, "--disable-gpu", tmpdir]
+
         try:
-            env = os.environ.copy()
-            env["VSCODE_DB_PATH"] = str(VSCODE_STATE_DB)
             result = subprocess.run(
-                [
-                    electron_path,
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    tmpdir,
-                ],
+                cmd,
+                input=json.dumps(encrypted_bytes),
                 capture_output=True,
                 text=True,
                 timeout=15,
-                env=env,
             )
         except subprocess.TimeoutExpired:
             return None
