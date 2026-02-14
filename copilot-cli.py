@@ -78,6 +78,259 @@ class C:
 
 
 # ═══════════════════════════════════════════════════════════════
+# SMART INPUT — Inline autocomplete cho / commands
+# ═══════════════════════════════════════════════════════════════
+import tty
+import termios
+import select as _select
+
+# Commands cho autocomplete
+SLASH_COMMANDS = [
+    "/models", "/select", "/info", "/system", "/system set", "/system reset",
+    "/clear", "/history", "/mcp", "/mcp add", "/mcp fetch", "/mcp shell",
+    "/mcp auto", "/mcp stop", "/token", "/refresh", "/help", "/exit",
+]
+
+# Model IDs — cập nhật runtime khi fetch_models
+_model_ids_for_complete: list[str] = []
+
+
+def _get_suggestions(text: str) -> list[str]:
+    """Trả về danh sách gợi ý dựa trên text đang gõ."""
+    if not text.startswith("/"):
+        return []
+
+    # /select <arg> → gợi ý số hoặc tên model
+    if text.startswith("/select "):
+        arg = text[8:]
+        suggestions = []
+        for i, mid in enumerate(_model_ids_for_complete, 1):
+            if not arg:
+                suggestions.append(f"/select {i}  {C.DIM}({mid}){C.RESET}")
+            elif arg.isdigit() and str(i).startswith(arg):
+                suggestions.append(f"/select {i}  {C.DIM}({mid}){C.RESET}")
+            elif mid.lower().startswith(arg.lower()):
+                suggestions.append(f"/select {mid}")
+        return suggestions[:8]  # Max 8 gợi ý
+
+    # / commands
+    matches = [cmd for cmd in SLASH_COMMANDS if cmd.startswith(text)]
+    # Chỉ hiện tối đa 10 gợi ý
+    return matches[:10]
+
+
+def _smart_input(prompt: str) -> str:
+    """Input với inline autocomplete popup cho / commands.
+
+    - Gõ / → hiện gợi ý bên dưới
+    - Gõ thêm chữ → thu hẹp gợi ý
+    - Tab → chọn gợi ý đầu tiên
+    - ↑/↓ → duyệt history
+    - Enter → submit
+    - Backspace → xóa
+    - Ctrl+C → raise KeyboardInterrupt
+    """
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    buf = []        # Ký tự đang gõ
+    cursor = 0      # Vị trí con trỏ trong buf
+    prev_suggestion_lines = 0  # Số dòng gợi ý đang hiển thị
+
+    # History
+    if not hasattr(_smart_input, "_history"):
+        _smart_input._history = []
+    history = _smart_input._history
+    hist_idx = len(history)  # Bắt đầu ở cuối (dòng mới)
+    saved_buf = None  # Lưu dòng đang gõ khi duyệt history
+
+    def _raw_prompt_len(prompt_str: str) -> int:
+        """Tính độ dài thật của prompt (bỏ ANSI escape codes)."""
+        import re
+        return len(re.sub(r'\033\[[^m]*m', '', prompt_str))
+
+    def _redraw():
+        nonlocal prev_suggestion_lines
+        text = "".join(buf)
+
+        # Xóa gợi ý cũ (di chuyển xuống rồi xóa từng dòng)
+        if prev_suggestion_lines > 0:
+            sys.stdout.write("\033[s")
+            for _ in range(prev_suggestion_lines):
+                sys.stdout.write("\r\n\033[2K")
+            sys.stdout.write("\033[u")
+
+        # Xóa dòng input hiện tại và vẽ lại
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.write(prompt)
+        sys.stdout.write(text)
+
+        # Đặt con trỏ đúng vị trí
+        if cursor < len(buf):
+            move_back = len(buf) - cursor
+            sys.stdout.write(f"\033[{move_back}D")
+
+        # Hiển thị gợi ý
+        suggestions = _get_suggestions(text) if text.startswith("/") else []
+        prev_suggestion_lines = len(suggestions)
+
+        if suggestions:
+            # Lưu vị trí con trỏ
+            sys.stdout.write("\033[s")
+            for i, s in enumerate(suggestions):
+                sys.stdout.write(f"\r\n\033[2K  {C.DIM}{s}{C.RESET}")
+            # Khôi phục vị trí con trỏ
+            sys.stdout.write("\033[u")
+
+        sys.stdout.flush()
+
+    def _clear_suggestions():
+        nonlocal prev_suggestion_lines
+        if prev_suggestion_lines > 0:
+            sys.stdout.write("\033[s")
+            for _ in range(prev_suggestion_lines):
+                sys.stdout.write("\r\n\033[2K")
+            sys.stdout.write("\033[u")
+            prev_suggestion_lines = 0
+            sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+
+        # In prompt ban đầu
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+
+        while True:
+            # Đọc 1 byte
+            ch = os.read(fd, 1)
+
+            if ch == b'\r' or ch == b'\n':
+                # Enter → submit
+                _clear_suggestions()
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                result = "".join(buf)
+                if result.strip():
+                    history.append(result)
+                return result
+
+            elif ch == b'\x03':
+                # Ctrl+C
+                _clear_suggestions()
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+
+            elif ch == b'\x04':
+                # Ctrl+D (EOF)
+                _clear_suggestions()
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                raise EOFError
+
+            elif ch == b'\x7f' or ch == b'\x08':
+                # Backspace
+                if cursor > 0:
+                    buf.pop(cursor - 1)
+                    cursor -= 1
+                    _redraw()
+
+            elif ch == b'\t':
+                # Tab → chọn gợi ý đầu tiên
+                text = "".join(buf)
+                suggestions = _get_suggestions(text) if text.startswith("/") else []
+                if suggestions:
+                    # Lấy text thật từ suggestion (bỏ ANSI + phần mô tả)
+                    import re
+                    raw = re.sub(r'\033\[[^m]*m', '', suggestions[0])
+                    # Nếu có phần "  (model_id)" thì chỉ lấy phần trước
+                    if "  (" in raw:
+                        raw = raw[:raw.index("  (")]
+                    buf = list(raw)
+                    cursor = len(buf)
+                    _redraw()
+
+            elif ch == b'\x1b':
+                # Escape sequence (arrows, etc.)
+                # Đọc thêm 2 byte
+                if _select.select([fd], [], [], 0.05)[0]:
+                    seq1 = os.read(fd, 1)
+                    if seq1 == b'[' and _select.select([fd], [], [], 0.05)[0]:
+                        seq2 = os.read(fd, 1)
+                        if seq2 == b'A':
+                            # ↑ Arrow Up — history previous
+                            if hist_idx > 0:
+                                if hist_idx == len(history):
+                                    saved_buf = list(buf)
+                                hist_idx -= 1
+                                buf = list(history[hist_idx])
+                                cursor = len(buf)
+                                _redraw()
+                        elif seq2 == b'B':
+                            # ↓ Arrow Down — history next
+                            if hist_idx < len(history):
+                                hist_idx += 1
+                                if hist_idx == len(history):
+                                    buf = saved_buf if saved_buf is not None else []
+                                else:
+                                    buf = list(history[hist_idx])
+                                cursor = len(buf)
+                                _redraw()
+                        elif seq2 == b'C':
+                            # → Arrow Right
+                            if cursor < len(buf):
+                                cursor += 1
+                                sys.stdout.write("\033[C")
+                                sys.stdout.flush()
+                        elif seq2 == b'D':
+                            # ← Arrow Left
+                            if cursor > 0:
+                                cursor -= 1
+                                sys.stdout.write("\033[D")
+                                sys.stdout.flush()
+                        elif seq2 == b'3':
+                            # Delete key (ESC [ 3 ~)
+                            if _select.select([fd], [], [], 0.05)[0]:
+                                os.read(fd, 1)  # consume '~'
+                            if cursor < len(buf):
+                                buf.pop(cursor)
+                                _redraw()
+                        elif seq2 == b'H':
+                            # Home
+                            cursor = 0
+                            _redraw()
+                        elif seq2 == b'F':
+                            # End
+                            cursor = len(buf)
+                            _redraw()
+                    else:
+                        pass  # Unknown escape
+                else:
+                    pass  # Single ESC
+
+            elif ch >= b' ':
+                # Printable character (bao gồm UTF-8 multi-byte)
+                # Xử lý UTF-8
+                byte = ch[0]
+                if byte < 0x80:
+                    char = ch.decode('utf-8')
+                elif byte < 0xE0:
+                    char = (ch + os.read(fd, 1)).decode('utf-8', errors='replace')
+                elif byte < 0xF0:
+                    char = (ch + os.read(fd, 2)).decode('utf-8', errors='replace')
+                else:
+                    char = (ch + os.read(fd, 3)).decode('utf-8', errors='replace')
+
+                buf.insert(cursor, char)
+                cursor += 1
+                _redraw()
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+# ═══════════════════════════════════════════════════════════════
 # SYSTEM PROMPT
 # ═══════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = (
@@ -240,6 +493,9 @@ class CopilotClient:
             # Build index ngay khi fetch
             ordered = self._get_chat_models_ordered()
             self._model_index = {str(i): m.get("id") for i, m in enumerate(ordered, 1)}
+            # Cập nhật cho autocomplete
+            global _model_ids_for_complete
+            _model_ids_for_complete = [m.get("id", "") for m in ordered]
 
             return True
 
@@ -1107,7 +1363,7 @@ def main():
             # Prompt
             model_label = client.selected_model or "no-model"
             prompt_str = f"{C.BOLD}{C.GREEN}[{model_label}]{C.RESET} {C.BOLD}>{C.RESET} "
-            user_input = input(prompt_str).strip()
+            user_input = _smart_input(prompt_str).strip()
         except (KeyboardInterrupt, EOFError):
             print(f"\n{C.GREEN}[+] Bye! 👋{C.RESET}")
             break
