@@ -136,6 +136,7 @@ def _smart_input(prompt: str) -> str:
     buf = []        # Ký tự đang gõ
     cursor = 0      # Vị trí con trỏ trong buf
     prev_suggestion_lines = 0  # Số dòng gợi ý đang hiển thị
+    prev_total_lines = 0       # Tổng số dòng vật lý (prompt+text) lần vẽ trước
 
     # History
     if not hasattr(_smart_input, "_history"):
@@ -144,55 +145,92 @@ def _smart_input(prompt: str) -> str:
     hist_idx = len(history)  # Bắt đầu ở cuối (dòng mới)
     saved_buf = None  # Lưu dòng đang gõ khi duyệt history
 
-    def _raw_prompt_len(prompt_str: str) -> int:
-        """Tính độ dài thật của prompt (bỏ ANSI escape codes)."""
-        import re
-        return len(re.sub(r'\033\[[^m]*m', '', prompt_str))
+    import re as _re
+
+    def _visible_len(s: str) -> int:
+        """Tính độ dài hiển thị (bỏ ANSI escape codes)."""
+        return len(_re.sub(r'\033\[[^m]*m', '', s))
+
+    def _get_term_width() -> int:
+        try:
+            return os.get_terminal_size().columns
+        except OSError:
+            return 80
+
+    # Track the physical line the cursor is on (0-based from the first prompt line)
+    # After _redraw(), this is updated to reflect cursor's actual physical line.
+    _cursor_phys_line = [0]
 
     def _redraw():
-        nonlocal prev_suggestion_lines
+        nonlocal prev_suggestion_lines, prev_total_lines
         text = "".join(buf)
+        term_w = _get_term_width()
+        prompt_vis = _visible_len(prompt)
 
-        # Xóa gợi ý cũ (di chuyển xuống rồi xóa từng dòng)
-        if prev_suggestion_lines > 0:
-            sys.stdout.write("\033[s")
-            for _ in range(prev_suggestion_lines):
-                sys.stdout.write("\r\n\033[2K")
-            sys.stdout.write("\033[u")
+        # Tính số dòng vật lý mà prompt+text chiếm
+        total_visible = prompt_vis + len(text)
+        cur_lines = max(1, (total_visible + term_w - 1) // term_w)
 
-        # Xóa dòng input hiện tại và vẽ lại
-        sys.stdout.write("\r\033[2K")
+        # === Bước 1: Di chuyển con trỏ về dòng đầu tiên của prompt ===
+        up_from_cursor = _cursor_phys_line[0]
+        if up_from_cursor > 0:
+            sys.stdout.write(f"\033[{up_from_cursor}A")
+
+        # === Bước 2: Xóa từ đầu dòng prompt đến hết màn hình ===
+        sys.stdout.write("\r\033[J")
+
+        # === Bước 3: Vẽ lại prompt + text ===
         sys.stdout.write(prompt)
         sys.stdout.write(text)
 
-        # Đặt con trỏ đúng vị trí
-        if cursor < len(buf):
-            move_back = len(buf) - cursor
-            sys.stdout.write(f"\033[{move_back}D")
+        prev_total_lines = cur_lines
+        prev_suggestion_lines = 0
 
-        # Hiển thị gợi ý
+        # === Bước 4: Tính vị trí cursor trong text ===
+        cursor_pos = prompt_vis + cursor
+        cursor_line = cursor_pos // term_w
+        cursor_col = cursor_pos % term_w
+
+        # Tính end_line (dòng vật lý cuối cùng sau khi viết text)
+        if total_visible == 0:
+            end_line = 0
+        elif total_visible % term_w == 0:
+            end_line = total_visible // term_w
+        else:
+            end_line = (total_visible - 1) // term_w
+
+        # === Bước 5: Hiển thị gợi ý (trước khi di chuyển cursor về vị trí đúng) ===
+        # Lúc này cursor đang ở cuối text (end_line).
+        # Viết suggestions xuống phía dưới, rồi tự di chuyển lên cursor_line.
         suggestions = _get_suggestions(text) if text.startswith("/") else []
-        prev_suggestion_lines = len(suggestions)
+        n_sugg = len(suggestions)
+        prev_suggestion_lines = n_sugg
 
         if suggestions:
-            # Lưu vị trí con trỏ
-            sys.stdout.write("\033[s")
-            for i, s in enumerate(suggestions):
-                sys.stdout.write(f"\r\n\033[2K  {C.DIM}{s}{C.RESET}")
-            # Khôi phục vị trí con trỏ
-            sys.stdout.write("\033[u")
+            for s in suggestions:
+                sys.stdout.write(f"\r\n  {C.DIM}{s}{C.RESET}")
+            # Bây giờ cursor ở dòng end_line + n_sugg
+            # Cần quay về cursor_line
+            total_up = (end_line - cursor_line) + n_sugg
+            if total_up > 0:
+                sys.stdout.write(f"\033[{total_up}A")
+        else:
+            # Không có suggestion, chỉ cần di chuyển từ end_line về cursor_line
+            lines_up = end_line - cursor_line
+            if lines_up > 0:
+                sys.stdout.write(f"\033[{lines_up}A")
+            elif lines_up < 0:
+                sys.stdout.write(f"\033[{-lines_up}B")
+
+        # Di chuyển về cột đúng
+        if cursor_col > 0:
+            sys.stdout.write(f"\r\033[{cursor_col}C")
+        else:
+            sys.stdout.write("\r")
+
+        _cursor_phys_line[0] = cursor_line
 
         sys.stdout.flush()
-
-    def _clear_suggestions():
-        nonlocal prev_suggestion_lines
-        if prev_suggestion_lines > 0:
-            sys.stdout.write("\033[s")
-            for _ in range(prev_suggestion_lines):
-                sys.stdout.write("\r\n\033[2K")
-            sys.stdout.write("\033[u")
-            prev_suggestion_lines = 0
-            sys.stdout.flush()
 
     try:
         tty.setraw(fd)
@@ -207,8 +245,20 @@ def _smart_input(prompt: str) -> str:
 
             if ch == b'\r' or ch == b'\n':
                 # Enter → submit
-                _clear_suggestions()
-                sys.stdout.write("\r\n")
+                # Di chuyển con trỏ xuống cuối text, xóa hết phía dưới
+                term_w = _get_term_width()
+                prompt_vis = _visible_len(prompt)
+                total_vis = prompt_vis + len(buf)
+                if total_vis == 0:
+                    end_line = 0
+                elif total_vis % term_w == 0:
+                    end_line = total_vis // term_w
+                else:
+                    end_line = (total_vis - 1) // term_w
+                down = end_line - _cursor_phys_line[0]
+                if down > 0:
+                    sys.stdout.write(f"\033[{down}B")
+                sys.stdout.write("\033[J\r\n")  # xóa từ cursor đến hết màn hình + xuống dòng
                 sys.stdout.flush()
                 result = "".join(buf)
                 if result.strip():
@@ -217,15 +267,37 @@ def _smart_input(prompt: str) -> str:
 
             elif ch == b'\x03':
                 # Ctrl+C
-                _clear_suggestions()
-                sys.stdout.write("\r\n")
+                term_w = _get_term_width()
+                prompt_vis = _visible_len(prompt)
+                total_vis = prompt_vis + len(buf)
+                if total_vis == 0:
+                    end_line = 0
+                elif total_vis % term_w == 0:
+                    end_line = total_vis // term_w
+                else:
+                    end_line = (total_vis - 1) // term_w
+                down = end_line - _cursor_phys_line[0]
+                if down > 0:
+                    sys.stdout.write(f"\033[{down}B")
+                sys.stdout.write("\033[J\r\n")
                 sys.stdout.flush()
                 raise KeyboardInterrupt
 
             elif ch == b'\x04':
                 # Ctrl+D (EOF)
-                _clear_suggestions()
-                sys.stdout.write("\r\n")
+                term_w = _get_term_width()
+                prompt_vis = _visible_len(prompt)
+                total_vis = prompt_vis + len(buf)
+                if total_vis == 0:
+                    end_line = 0
+                elif total_vis % term_w == 0:
+                    end_line = total_vis // term_w
+                else:
+                    end_line = (total_vis - 1) // term_w
+                down = end_line - _cursor_phys_line[0]
+                if down > 0:
+                    sys.stdout.write(f"\033[{down}B")
+                sys.stdout.write("\033[J\r\n")
                 sys.stdout.flush()
                 raise EOFError
 
@@ -281,14 +353,12 @@ def _smart_input(prompt: str) -> str:
                             # → Arrow Right
                             if cursor < len(buf):
                                 cursor += 1
-                                sys.stdout.write("\033[C")
-                                sys.stdout.flush()
+                                _redraw()
                         elif seq2 == b'D':
                             # ← Arrow Left
                             if cursor > 0:
                                 cursor -= 1
-                                sys.stdout.write("\033[D")
-                                sys.stdout.flush()
+                                _redraw()
                         elif seq2 == b'3':
                             # Delete key (ESC [ 3 ~)
                             if _select.select([fd], [], [], 0.05)[0]:
