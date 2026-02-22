@@ -7,14 +7,18 @@ Hỗ trợ:
   - filesystem: đọc/ghi file, quản lý thư mục
   - fetch: tải nội dung web
   - shell: thực thi lệnh terminal
+  - playwright: tương tác trình duyệt (click, navigate, screenshot, ...)
+  - web_search: tìm kiếm web qua DuckDuckGo HTML (built-in, không cần API key)
 """
 
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import shutil
+import urllib.parse
 
 
 class MCPManager:
@@ -42,11 +46,11 @@ class MCPManager:
         self._thread.start()
         self._started = True
 
-    def _run_async(self, coro):
+    def _run_async(self, coro, timeout=120):
         """Chạy coroutine trong background event loop và chờ kết quả."""
         self._ensure_event_loop()
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=60)
+        return future.result(timeout=timeout)
 
     def add_filesystem_server(self, allowed_dirs: list) -> bool:
         """Thêm MCP Filesystem Server."""
@@ -158,14 +162,204 @@ class MCPManager:
             print(f"[MCP] Lỗi kết nối shell server: {e}", file=sys.stderr)
             return False
 
-    async def _connect_server(self, name: str, command: str, args: list) -> dict:
+    def add_web_search(self) -> bool:
+        """Thêm built-in web_search tool (DuckDuckGo HTML, không cần API key).
+        
+        Tool này KHÔNG dùng MCP server riêng, mà đăng ký trực tiếp 
+        như một virtual tool trong MCPManager.
+        """
+        if "web_search" in self.servers:
+            return True
+
+        tool_def = {
+            "name": "web_search",
+            "description": (
+                "Search the web using DuckDuckGo. Returns a list of results with "
+                "title, URL, and snippet. Use this when you need to find current "
+                "information, look up facts, or research topics on the internet."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query string",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default 5, max 20)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        }
+
+        # Đăng ký virtual server (không có MCP session)
+        self.servers["web_search"] = {
+            "name": "web_search",
+            "session": None,  # built-in, không cần session
+            "session_ctx": None,
+            "stdio_ctx": None,
+            "tools": [tool_def],
+            "serverInfo": {"name": "Built-in Web Search", "version": "1.0"},
+        }
+        self.tool_map["web_search"] = "web_search"
+        return True
+
+    @staticmethod
+    def _ddg_search(query: str, max_results: int = 5) -> list:
+        """Tìm kiếm DuckDuckGo (không cần API key).
+        
+        Dùng thư viện duckduckgo_search (pure Python).
+        Trả về list[dict] với keys: title, url, snippet.
+        """
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            try:
+                from duckduckgo_search import DDGS
+            except ImportError:
+                return [{"error": "Cần cài: pip install ddgs"}]
+
+        try:
+            with DDGS() as ddgs:
+                raw_results = list(ddgs.text(query, max_results=max_results))
+        except Exception as e:
+            # Fallback: thử qua lite HTML endpoint
+            return MCPManager._ddg_search_html_fallback(query, max_results, str(e))
+
+        if not raw_results:
+            return [{"error": "No results found", "query": query}]
+
+        results = []
+        for r in raw_results:
+            results.append({
+                "title": r.get("title", ""),
+                "url": r.get("href", ""),
+                "snippet": r.get("body", ""),
+            })
+        return results
+
+    @staticmethod
+    def _ddg_search_html_fallback(query: str, max_results: int = 5, primary_error: str = "") -> list:
+        """Fallback: search DuckDuckGo qua HTML lite endpoint."""
+        import requests as _requests
+
+        url = "https://lite.duckduckgo.com/lite/"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        }
+        data = {"q": query}
+
+        try:
+            resp = _requests.post(url, headers=headers, data=data, timeout=15)
+            resp.raise_for_status()
+        except Exception as e:
+            return [{"error": f"Both search methods failed. Primary: {primary_error}. Fallback: {e}"}]
+
+        html = resp.text
+        results = []
+
+        # DuckDuckGo Lite format:
+        # Links: <a rel="nofollow" href="URL" class='result-link'>Title</a>
+        # Snippet: <td class="result-snippet">text</td>
+        links = re.findall(
+            r"class='result-link'[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>",
+            html,
+            re.DOTALL,
+        )
+        snippets = re.findall(
+            r'class="result-snippet"[^>]*>(.*?)</td>',
+            html,
+            re.DOTALL,
+        )
+
+        for i, (href, title_raw) in enumerate(links[:max_results]):
+            title = re.sub(r'<[^>]+>', '', title_raw).strip()
+            snippet = ""
+            if i < len(snippets):
+                snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()
+
+            # Decode DDG redirect URL
+            link = href.strip()
+            if "uddg=" in link:
+                uddg_match = re.search(r'uddg=([^&]+)', link)
+                if uddg_match:
+                    link = urllib.parse.unquote(uddg_match.group(1))
+
+            # Skip ads
+            if "duckduckgo.com/y.js" in link or "ad_provider" in link:
+                continue
+
+            if title or link:
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "snippet": snippet,
+                })
+
+        if not results:
+            return [{"error": f"No results found. Primary error: {primary_error}", "query": query}]
+
+        return results
+
+        if not results:
+            return [{"error": "No results found", "query": query}]
+
+        return results
+
+    def add_playwright_server(self, headless: bool = True) -> bool:
+        """Thêm Playwright MCP Server (tương tác trình duyệt).
+        
+        Hỗ trợ: navigate, click, screenshot, fill, evaluate, v.v.
+        Cài: npx @playwright/mcp
+        
+        Args:
+            headless: True = chạy ẩn (mặc định), False = hiện trình duyệt lên màn hình.
+        """
+        mcp_bin = shutil.which("mcp-server-playwright")
+        if mcp_bin:
+            command = mcp_bin
+            args = [] if not headless else ["--headless"]
+        else:
+            command = "npx"
+            args = ["-y", "@playwright/mcp"]
+            if headless:
+                args.append("--headless")
+
+        try:
+            handle = self._run_async(
+                self._connect_server("playwright", command, args)
+            )
+            if handle:
+                self.servers["playwright"] = handle
+                for tool in handle["tools"]:
+                    self.tool_map[tool["name"]] = "playwright"
+                return True
+            return False
+        except Exception as e:
+            print(f"[MCP] Lỗi kết nối Playwright server: {e}", file=sys.stderr)
+            return False
+
+    async def _connect_server(self, name: str, command: str, args: list, env: dict = None) -> dict:
         """Kết nối tới MCP server (async)."""
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
 
+        # Merge env variables
+        server_env = None
+        if env:
+            server_env = dict(os.environ)
+            server_env.update(env)
+
         server_params = StdioServerParameters(
             command=command,
             args=args,
+            env=server_env,
         )
 
         # Tạo context managers và giữ chúng mở
@@ -212,24 +406,17 @@ class MCPManager:
         """Chuyển đổi MCP tools sang OpenAI function calling format.
         
         Chỉ expose các tools thiết yếu để giảm token cost.
-        Filesystem: 14 tools → 6 tools (bỏ deprecated, redundant, ít dùng)
+        Filesystem: 14 tools → 5 tools (bỏ deprecated, redundant, ít dùng)
+        Các server web (playwright, web_search): cho phép tất cả tools.
         """
-        # Tools cần giữ (tên tool -> giữ/bỏ)
-        # Bỏ: read_file (deprecated, dùng read_text_file), read_media_file (ít dùng),
-        #      read_multiple_files (dùng read_text_file nhiều lần), 
-        #      list_directory_with_sizes (dùng list_directory),
-        #      directory_tree (dùng list_directory), move_file (ít dùng),
-        #      create_directory (write_file tự tạo), list_allowed_directories (internal),
-        #      get_file_info (ít dùng)
-        ESSENTIAL_TOOLS = {
-            # Filesystem - chỉ giữ 5 tools chính
+        # Whitelist tools cho filesystem (quá nhiều tools thừa)
+        FILESYSTEM_ESSENTIAL = {
             "read_text_file", "write_file", "edit_file", 
             "list_directory", "search_files",
-            # Fetch
-            "fetch",
-            # Shell
-            "execute_command",
         }
+
+        # Server-level whitelist: cho phép tất cả tools từ các server này
+        ALLOW_ALL_SERVERS = {"playwright", "web_search", "fetch", "shell"}
 
         openai_tools = []
 
@@ -237,8 +424,12 @@ class MCPManager:
             for tool in handle["tools"]:
                 tool_name = tool["name"]
                 
-                # Chỉ gửi essential tools
-                if tool_name not in ESSENTIAL_TOOLS:
+                # Filter logic
+                if server_name == "filesystem":
+                    if tool_name not in FILESYSTEM_ESSENTIAL:
+                        continue
+                elif server_name not in ALLOW_ALL_SERVERS:
+                    # Server không được biết -> skip
                     continue
 
                 # Rút gọn description để tiết kiệm tokens
@@ -317,9 +508,23 @@ class MCPManager:
         if not handle:
             return f"[Lỗi] Server '{server_name}' không hoạt động"
 
+        # Built-in web_search — xử lý trực tiếp, không qua MCP session
+        if tool_name == "web_search":
+            try:
+                query = arguments.get("query", "")
+                max_results = int(arguments.get("max_results", 5))
+                max_results = min(max(max_results, 1), 20)
+                results = self._ddg_search(query, max_results)
+                return json.dumps(results, ensure_ascii=False, indent=2)
+            except Exception as e:
+                return f"[Lỗi web_search] {e}"
+
         try:
+            # Shell commands cần timeout dài hơn vì tool có thể chạy nmap, nuclei, etc.
+            tool_timeout = 300 if server_name == "shell" else 120
             result = self._run_async(
-                handle["session"].call_tool(tool_name, arguments)
+                handle["session"].call_tool(tool_name, arguments),
+                timeout=tool_timeout,
             )
 
             # Kiểm tra error flag
@@ -345,6 +550,20 @@ class MCPManager:
             err_msg = str(e).strip()
             if not err_msg:
                 err_msg = f"{type(e).__name__}"
+            # Thêm hướng dẫn cụ thể cho timeout errors
+            if isinstance(e, TimeoutError) or "timeout" in err_msg.lower():
+                tool_timeout_used = 300 if server_name == "shell" else 120
+                args_hint = json.dumps(arguments, ensure_ascii=False)[:200]
+                return (
+                    f"[Tool Error] Command timed out after {tool_timeout_used}s. "
+                    f"The command took too long to complete. "
+                    f"Tips: 1) Add timeout flags to your command (e.g. --connect-timeout 5 --max-time 15 for curl, "
+                    f"-timeout 10 for ffuf, --timeout=15 for sqlmap). "
+                    f"2) For long-running tools (nmap, nuclei, subfinder), limit scope: "
+                    f"fewer targets, specific ports (-p 80,443), rate limits (-rl 50). "
+                    f"3) Skip unresponsive hosts and move to the next target. "
+                    f"Args were: {args_hint}"
+                )
             return f"[Lỗi tool] {err_msg}"
 
     def display_tools(self):
@@ -372,6 +591,9 @@ class MCPManager:
         """Dừng tất cả MCP servers."""
         if self._loop and self._started:
             for name, handle in list(self.servers.items()):
+                # Skip virtual servers (built-in, không có session)
+                if handle.get("session") is None:
+                    continue
                 try:
                     self._run_async(self._disconnect_server(handle))
                 except Exception:
