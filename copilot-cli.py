@@ -17,10 +17,19 @@ Commands:
   /system       - Xem/chỉnh sửa system prompt
   /clear        - Xóa lịch sử hội thoại
   /history      - Xem lịch sử hội thoại
+  /save [tên]   - Lưu phiên chat hiện tại
+  /load [số|tên]- Load phiên chat đã lưu
+  /sessions     - Xem danh sách phiên đã lưu
+  /sessions rename <số> <tên mới> - Đổi tên phiên
+  /sessions delete <số|tên>       - Xóa phiên
   /mcp          - Xem danh sách MCP tools
   /mcp add <dir>- Thêm thư mục cho MCP Filesystem
   /mcp fetch    - Thêm Fetch Server (tải web)
   /mcp shell    - Thêm Shell Server (chạy terminal)
+  /mcp search   - Thêm Web Search (DuckDuckGo, không cần API)
+  /mcp playwright - Thêm Playwright (trình duyệt, headless)
+  /mcp playwright headed - Playwright hiện trình duyệt lên màn hình
+  /mcp web      - Thêm tất cả Web servers
   /mcp auto     - Thêm tất cả MCP servers
   /mcp stop     - Dừng tất cả MCP servers
   /help         - Xem hướng dẫn
@@ -63,6 +72,12 @@ GITHUB_API_VERSION = "2025-04-01"
 COPILOT_API_VERSION = "2025-07-16"
 USER_AGENT = "GitHubCopilotChat/0.31.5"
 
+# Models sử dụng Responses API (POST /responses) thay vì Chat Completions API (POST /chat/completions)
+RESPONSES_API_MODELS = {"oswe-vscode-prime"}
+
+# Sessions directory
+SESSIONS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "sessions")
+
 # Colors
 class C:
     RESET   = "\033[0m"
@@ -87,8 +102,12 @@ import select as _select
 # Commands cho autocomplete
 SLASH_COMMANDS = [
     "/models", "/select", "/info", "/system", "/system set", "/system reset",
-    "/clear", "/history", "/mcp", "/mcp add", "/mcp fetch", "/mcp shell",
-    "/mcp auto", "/mcp stop", "/token", "/refresh", "/help", "/exit",
+    "/clear", "/history",
+    "/save", "/load", "/sessions", "/sessions rename", "/sessions delete",
+    "/mcp", "/mcp add", "/mcp fetch", "/mcp shell",
+    "/mcp auto", "/mcp stop", "/mcp search", "/mcp playwright",
+    "/mcp playwright headed", "/mcp playwright headless",
+    "/mcp web", "/token", "/refresh", "/help", "/exit",
 ]
 
 # Model IDs — cập nhật runtime khi fetch_models
@@ -448,6 +467,390 @@ SYSTEM_PROMPT = (
 
 
 # ═══════════════════════════════════════════════════════════════
+# SESSION MANAGER — Lưu / Load / Quản lý phiên chat
+# ═══════════════════════════════════════════════════════════════
+import re as _re_mod
+import glob as _glob_mod
+from datetime import datetime as _datetime
+
+
+class SessionManager:
+    """Quản lý các phiên chat (lưu/load/rename/delete)."""
+
+    def __init__(self, sessions_dir: str = SESSIONS_DIR):
+        self.sessions_dir = sessions_dir
+        os.makedirs(self.sessions_dir, exist_ok=True)
+
+    def _sanitize_name(self, name: str) -> str:
+        """Chuẩn hóa tên phiên thành tên file an toàn."""
+        # Giữ unicode nhưng loại ký tự đặc biệt filesystem
+        name = name.strip()
+        name = _re_mod.sub(r'[\\/:*?"<>|]', '_', name)
+        name = _re_mod.sub(r'\s+', '_', name)
+        return name[:100] or "unnamed"
+
+    def _gen_session_id(self) -> str:
+        """Tạo ID duy nhất cho phiên."""
+        return _datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def _list_session_files(self) -> list:
+        """Liệt kê tất cả file phiên, sắp xếp theo thời gian chỉnh sửa (mới nhất trước)."""
+        pattern = os.path.join(self.sessions_dir, "*.json")
+        files = _glob_mod.glob(pattern)
+        files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+        return files
+
+    def _load_session_meta(self, filepath: str) -> dict:
+        """Load metadata của phiên (không load toàn bộ messages để nhanh)."""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {
+                "file": filepath,
+                "name": data.get("name", "unnamed"),
+                "model": data.get("model", "?"),
+                "cwd": data.get("cwd", "?"),
+                "created_at": data.get("created_at", "?"),
+                "updated_at": data.get("updated_at", "?"),
+                "message_count": len(data.get("messages", [])),
+                "system_prompt_custom": data.get("system_prompt") != SYSTEM_PROMPT if data.get("system_prompt") else False,
+            }
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def save(self, client, name: str = None) -> str:
+        """Lưu phiên chat hiện tại.
+        
+        Returns: đường dẫn file đã lưu, hoặc None nếu lỗi.
+        """
+        if not client.messages:
+            print(f"{C.YELLOW}[!] Không có lịch sử chat để lưu.{C.RESET}")
+            return None
+
+        now = _datetime.now()
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        # user_named = True nếu user chủ động truyền tên
+        user_named = name is not None and name.strip() != ""
+
+        # Tạo tên tự động nếu chưa có
+        if not name:
+            # Lấy câu hỏi đầu tiên của user làm tên
+            first_user = ""
+            for m in client.messages:
+                if m.get("role") == "user":
+                    first_user = (m.get("content") or "")[:80]
+                    break
+            if first_user:
+                # Cắt dòng đầu, bỏ ký tự thừa
+                name = first_user.split("\n")[0].strip()
+            if not name:
+                name = f"session_{now.strftime('%Y%m%d_%H%M%S')}"
+
+        safe_name = self._sanitize_name(name)
+        session_id = self._gen_session_id()
+
+        # Kiểm tra xem đã có file với tên này chưa
+        # Nếu đang update phiên đã load → ghi đè
+        existing_file = getattr(client, '_loaded_session_file', None)
+        if existing_file and os.path.isfile(existing_file):
+            filepath = existing_file
+            # Giữ tên cũ nếu user không chủ động đặt tên mới
+            if not user_named:
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        old_data = json.load(f)
+                    name = old_data.get("name", name)
+                except (json.JSONDecodeError, OSError):
+                    pass
+        else:
+            # Tạo file mới
+            filename = f"{session_id}_{safe_name}.json"
+            filepath = os.path.join(self.sessions_dir, filename)
+
+        session_data = {
+            "name": name,
+            "model": client.selected_model,
+            "cwd": os.getcwd(),
+            "system_prompt": client.system_prompt,
+            "created_at": getattr(client, '_session_created_at', now_str),
+            "updated_at": now_str,
+            "messages": client.messages,
+        }
+
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(session_data, f, ensure_ascii=False, indent=2)
+            
+            # Đánh dấu file đang dùng (cho lần save tiếp theo ghi đè)
+            client._loaded_session_file = filepath
+            client._session_created_at = session_data["created_at"]
+
+            msg_count = len(client.messages)
+            print(f"{C.GREEN}[+] Đã lưu phiên: {C.BOLD}{name}{C.RESET}")
+            print(f"    {C.DIM}{msg_count} messages | Model: {client.selected_model}{C.RESET}")
+            print(f"    {C.DIM}File: {filepath}{C.RESET}")
+            return filepath
+
+        except OSError as e:
+            print(f"{C.RED}[!] Lỗi lưu phiên: {e}{C.RESET}")
+            return None
+
+    def load(self, client, identifier: str = None) -> bool:
+        """Load phiên chat từ file.
+        
+        identifier: số thứ tự (1-based) hoặc tên phiên (fuzzy match).
+        Nếu None → hiện danh sách để chọn.
+        """
+        files = self._list_session_files()
+        if not files:
+            print(f"{C.YELLOW}[!] Chưa có phiên nào được lưu.{C.RESET}")
+            return False
+
+        # Nếu không có identifier → hiện danh sách và cho chọn
+        if not identifier:
+            self.display_sessions()
+            try:
+                choice = input(f"\n{C.YELLOW}Chọn phiên (số): {C.RESET}").strip()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return False
+            if not choice:
+                return False
+            identifier = choice
+
+        # Tìm file phiên
+        filepath = None
+
+        # Thử parse số
+        if identifier.isdigit():
+            idx = int(identifier) - 1
+            if 0 <= idx < len(files):
+                filepath = files[idx]
+            else:
+                print(f"{C.RED}[!] Số phiên không hợp lệ (1-{len(files)}).{C.RESET}")
+                return False
+        else:
+            # Fuzzy match theo tên
+            identifier_lower = identifier.lower()
+            for f in files:
+                meta = self._load_session_meta(f)
+                if meta and identifier_lower in meta["name"].lower():
+                    filepath = f
+                    break
+
+            if not filepath:
+                print(f"{C.RED}[!] Không tìm thấy phiên: {identifier}{C.RESET}")
+                return False
+
+        # Load dữ liệu
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"{C.RED}[!] Lỗi đọc file phiên: {e}{C.RESET}")
+            return False
+
+        session_name = data.get("name", "unnamed")
+        session_cwd = data.get("cwd", "")
+        session_model = data.get("model", "")
+        session_messages = data.get("messages", [])
+        session_system = data.get("system_prompt", "")
+        created_at = data.get("created_at", "?")
+        updated_at = data.get("updated_at", "?")
+
+        # Hỏi có muốn chuyển thư mục không (nếu khác cwd hiện tại)
+        current_cwd = os.getcwd()
+        if session_cwd and session_cwd != current_cwd and os.path.isdir(session_cwd):
+            print(f"\n{C.YELLOW}  Phiên này được tạo tại: {C.BOLD}{session_cwd}{C.RESET}")
+            print(f"{C.YELLOW}  Thư mục hiện tại:       {C.BOLD}{current_cwd}{C.RESET}")
+            try:
+                switch = input(f"{C.YELLOW}  Chuyển sang thư mục cũ? [Y/n]: {C.RESET}").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                switch = "n"
+
+            if switch != "n":
+                os.chdir(session_cwd)
+                print(f"{C.GREEN}  [+] Đã chuyển sang: {session_cwd}{C.RESET}")
+                # Re-init filesystem MCP cho thư mục mới
+                if client.mcp_manager and "filesystem" in client.mcp_manager.servers:
+                    try:
+                        client.mcp_manager._run_async(
+                            client.mcp_manager._disconnect_server(
+                                client.mcp_manager.servers["filesystem"]
+                            )
+                        )
+                    except Exception:
+                        pass
+                    del client.mcp_manager.servers["filesystem"]
+                    client.mcp_manager.tool_map = {
+                        k: v for k, v in client.mcp_manager.tool_map.items()
+                        if v != "filesystem"
+                    }
+                    if client.mcp_manager.add_filesystem_server([session_cwd]):
+                        print(f"{C.GREEN}  [+] MCP Filesystem → {session_cwd}{C.RESET}")
+
+        # Restore messages & system prompt
+        client.messages = session_messages
+        if session_system:
+            client.system_prompt = session_system
+
+        # Restore model (nếu có trong danh sách)
+        if session_model and client.models:
+            for m in client.models:
+                if m.get("id") == session_model:
+                    client.selected_model = session_model
+                    break
+
+        # Đánh dấu file đang dùng
+        client._loaded_session_file = filepath
+        client._session_created_at = created_at
+
+        # Hiển thị summary
+        n_user = sum(1 for m in session_messages if m.get("role") == "user")
+        n_assistant = sum(1 for m in session_messages if m.get("role") == "assistant")
+        n_tool = sum(1 for m in session_messages if m.get("role") == "tool")
+
+        print()
+        print(f"{C.GREEN}[+] Đã load phiên: {C.BOLD}{session_name}{C.RESET}")
+        print(f"    {C.DIM}Model: {session_model} | CWD: {session_cwd}{C.RESET}")
+        print(f"    {C.DIM}Tạo: {created_at} | Cập nhật: {updated_at}{C.RESET}")
+        print(f"    {C.DIM}{len(session_messages)} messages ({n_user} user, {n_assistant} assistant, {n_tool} tool){C.RESET}")
+        print(f"    {C.DIM}Dùng /history để xem nội dung, /save để lưu tiếp.{C.RESET}")
+        print()
+        return True
+
+    def display_sessions(self):
+        """Hiển thị danh sách các phiên đã lưu."""
+        files = self._list_session_files()
+        if not files:
+            print(f"{C.YELLOW}[!] Chưa có phiên nào được lưu.{C.RESET}")
+            print(f"{C.DIM}    Dùng /save [tên] để lưu phiên hiện tại.{C.RESET}")
+            return
+
+        print()
+        print(f"{C.BOLD}{C.CYAN}{'═' * 80}{C.RESET}")
+        print(f"  {C.BOLD}💾 CÁC PHIÊN CHAT ĐÃ LƯU ({len(files)} phiên){C.RESET}")
+        print(f"{C.BOLD}{C.CYAN}{'═' * 80}{C.RESET}")
+
+        for i, filepath in enumerate(files, 1):
+            meta = self._load_session_meta(filepath)
+            if not meta:
+                continue
+
+            name = meta["name"]
+            model = meta["model"]
+            cwd = meta["cwd"]
+            updated = meta["updated_at"]
+            msg_count = meta["message_count"]
+            custom_sys = meta["system_prompt_custom"]
+
+            # Tags
+            tags = []
+            if custom_sys:
+                tags.append(f"{C.MAGENTA}[custom-prompt]{C.RESET}")
+
+            tag_str = " ".join(tags)
+
+            print(f"\n  {C.DIM}{i:>3}.{C.RESET} {C.BOLD}{C.WHITE}{name}{C.RESET} {tag_str}")
+            print(f"       {C.DIM}Model: {model} | {msg_count} msgs | {updated}{C.RESET}")
+            print(f"       {C.DIM}📁 {cwd}{C.RESET}")
+
+        print(f"\n{C.BOLD}{C.CYAN}{'═' * 80}{C.RESET}")
+        print(f"  {C.DIM}/load <số>                   - Load phiên{C.RESET}")
+        print(f"  {C.DIM}/save [tên]                  - Lưu phiên hiện tại{C.RESET}")
+        print(f"  {C.DIM}/sessions rename <số> <tên>  - Đổi tên phiên{C.RESET}")
+        print(f"  {C.DIM}/sessions delete <số>        - Xóa phiên{C.RESET}")
+        print()
+
+    def rename(self, identifier: str, new_name: str) -> bool:
+        """Đổi tên phiên."""
+        files = self._list_session_files()
+        if not files:
+            print(f"{C.YELLOW}[!] Chưa có phiên nào.{C.RESET}")
+            return False
+
+        if not identifier.isdigit():
+            print(f"{C.RED}[!] Dùng số thứ tự: /sessions rename <số> <tên mới>{C.RESET}")
+            return False
+
+        idx = int(identifier) - 1
+        if idx < 0 or idx >= len(files):
+            print(f"{C.RED}[!] Số phiên không hợp lệ (1-{len(files)}).{C.RESET}")
+            return False
+
+        filepath = files[idx]
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            old_name = data.get("name", "unnamed")
+            data["name"] = new_name.strip()
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            print(f"{C.GREEN}[+] Đổi tên: {C.DIM}{old_name}{C.RESET} → {C.BOLD}{new_name}{C.RESET}")
+            return True
+
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"{C.RED}[!] Lỗi: {e}{C.RESET}")
+            return False
+
+    def delete(self, identifier: str) -> bool:
+        """Xóa phiên."""
+        files = self._list_session_files()
+        if not files:
+            print(f"{C.YELLOW}[!] Chưa có phiên nào.{C.RESET}")
+            return False
+
+        filepath = None
+
+        if identifier.isdigit():
+            idx = int(identifier) - 1
+            if 0 <= idx < len(files):
+                filepath = files[idx]
+            else:
+                print(f"{C.RED}[!] Số phiên không hợp lệ (1-{len(files)}).{C.RESET}")
+                return False
+        else:
+            # Fuzzy match
+            for f in files:
+                meta = self._load_session_meta(f)
+                if meta and identifier.lower() in meta["name"].lower():
+                    filepath = f
+                    break
+
+        if not filepath:
+            print(f"{C.RED}[!] Không tìm thấy phiên: {identifier}{C.RESET}")
+            return False
+
+        # Load tên để confirm
+        meta = self._load_session_meta(filepath)
+        name = meta["name"] if meta else os.path.basename(filepath)
+
+        try:
+            confirm = input(f"{C.YELLOW}Xóa phiên \"{name}\"? [y/N]: {C.RESET}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return False
+
+        if confirm != "y":
+            print(f"{C.DIM}  Đã hủy.{C.RESET}")
+            return False
+
+        try:
+            os.remove(filepath)
+            print(f"{C.GREEN}[+] Đã xóa phiên: {name}{C.RESET}")
+            return True
+        except OSError as e:
+            print(f"{C.RED}[!] Lỗi xóa: {e}{C.RESET}")
+            return False
+
+
+# ═══════════════════════════════════════════════════════════════
 # COPILOT CLIENT
 # ═══════════════════════════════════════════════════════════════
 class CopilotClient:
@@ -463,6 +866,10 @@ class CopilotClient:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
         self.mcp_manager = MCPManager() if MCPManager else None
+
+        # Tool calling config
+        self.max_tool_rounds = 30
+        self.max_consecutive_errors = 3  # 0 = unlimited
 
         # Persistent session identifiers (like VS Code)
         self.session_id = f"{uuid.uuid4()}{int(time.time() * 1000)}"
@@ -779,16 +1186,29 @@ class CopilotClient:
         interaction_id = str(uuid.uuid4())
 
         # Tool calling loop - AI có thể gọi nhiều tools liên tiếp
-        max_tool_rounds = 30
+        max_tool_rounds = self.max_tool_rounds
         consecutive_errors = 0
-        max_consecutive_errors = 3
+        max_consecutive_errors = self.max_consecutive_errors
         for _round in range(max_tool_rounds):
-            result = self._send_chat_request(
-                request_id=interaction_request_id,
-                interaction_id=interaction_id,
-                round_number=_round,
-            )
+            # Auto-retry khi gặp lỗi kết nối (RemoteDisconnected, timeout, etc.)
+            result = None
+            for _attempt in range(3):
+                result = self._send_chat_request(
+                    request_id=interaction_request_id,
+                    interaction_id=interaction_id,
+                    round_number=_round,
+                )
+                if result is not None:
+                    break
+                # Lỗi kết nối — retry sau delay
+                delay = 2 ** _attempt  # 1s, 2s, 4s
+                print(f"{C.YELLOW}[↻] Retrying in {delay}s... (attempt {_attempt + 2}/3){C.RESET}")
+                time.sleep(delay)
+                # Refresh token phòng trường hợp hết hạn
+                self.ensure_token()
+
             if result is None:
+                print(f"{C.RED}[!] Thất bại sau 3 lần retry.{C.RESET}")
                 return ""
 
             full_content, tool_calls = result
@@ -800,7 +1220,24 @@ class CopilotClient:
                 return full_content
 
             # Có tool calls → thực thi và gửi lại
-            # Thêm assistant message với tool_calls
+            # Validate: lọc bỏ tool calls có name hoặc id rỗng (model hallucinate)
+            valid_tool_calls = []
+            for tc in tool_calls:
+                _tc_id = tc.get("id", "")
+                _tc_name = tc.get("function", {}).get("name", "")
+                if not _tc_id or not _tc_name:
+                    print(f"     {C.RED}[!] Bỏ qua tool call không hợp lệ (id={repr(_tc_id)}, name={repr(_tc_name)}){C.RESET}")
+                    continue
+                valid_tool_calls.append(tc)
+            tool_calls = valid_tool_calls
+
+            # Nếu sau khi lọc không còn tool call hợp lệ → trả content luôn
+            if not tool_calls:
+                if full_content:
+                    self.messages.append({"role": "assistant", "content": full_content})
+                return full_content
+
+            # Thêm assistant message với tool_calls (chỉ các tool calls hợp lệ)
             assistant_msg = {"role": "assistant", "content": full_content or None, "tool_calls": tool_calls}
             self.messages.append(assistant_msg)
 
@@ -866,7 +1303,7 @@ class CopilotClient:
             # Track consecutive errors — stop nếu model cứ gọi tool sai liên tục
             if round_had_error:
                 consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
+                if max_consecutive_errors > 0 and consecutive_errors >= max_consecutive_errors:
                     print(f"\n{C.RED}[!] Dừng: {consecutive_errors} lần tool call liên tiếp bị lỗi.{C.RESET}")
                     self.messages.append({"role": "assistant", "content": full_content or "[Tool calling failed repeatedly]"})
                     return full_content or ""
@@ -967,8 +1404,20 @@ class CopilotClient:
 
         return result
 
+    def _is_responses_api(self) -> bool:
+        """Kiểm tra model hiện tại có dùng Responses API không."""
+        return self.selected_model in RESPONSES_API_MODELS
+
     def _send_chat_request(self, request_id=None, interaction_id=None, round_number=0):
         """Gửi một request chat và trả về (content, tool_calls) hoặc None nếu lỗi."""
+        # Delegate sang Responses API nếu model yêu cầu
+        if self._is_responses_api():
+            return self._send_responses_request(
+                request_id=request_id,
+                interaction_id=interaction_id,
+                round_number=round_number,
+            )
+
         # Build system prompt — inject MCP tools description nếu có
         effective_system = self.system_prompt
 
@@ -981,8 +1430,9 @@ class CopilotClient:
                 "edit_file": "Edit an existing file (partial changes)",
                 "list_directory": "List files/folders in a directory",
                 "search_files": "Search for files matching a pattern",
-                "fetch": "Fetch main content from a URL. Useful for summarizing or analyzing web pages, searching the web, or calling APIs",
+                "fetch": "Fetch main content from a URL. Useful for summarizing or analyzing web pages or calling APIs. Use web_search first to find URLs, then fetch to read their content",
                 "execute_command": "Run shell commands (bash, python, curl, etc.)",
+                "web_search": "Search the web using DuckDuckGo (no API key needed). Returns results with title, URL, snippet. Use this to find current information, look up facts, or research topics",
             }
             tool_lines = []
             for handle in self.mcp_manager.servers.values():
@@ -1059,7 +1509,12 @@ class CopilotClient:
             if resp.status_code != 200:
                 err_text = resp.text[:500]
                 print(f"{C.RED}[!] Chat thất bại (HTTP {resp.status_code}): {err_text}{C.RESET}")
-                self.messages.pop()  # Xóa message lỗi
+                # Xóa messages bị lỗi: nếu đang giữa tool loop thì phải rollback
+                # tất cả tool results + assistant message cho đến user message gốc
+                while self.messages and self.messages[-1].get("role") in ("tool", "assistant"):
+                    removed = self.messages.pop()
+                    if removed.get("role") == "assistant" and removed.get("tool_calls"):
+                        break  # Đã xóa hết 1 round (assistant + tools)
                 return None
 
             # Force UTF-8 encoding để tránh mojibake tiếng Việt
@@ -1140,8 +1595,16 @@ class CopilotClient:
                                     idx = existing_idx
                                     break
                         else:
-                            # Không có id → dùng index (fallback cho streaming chunks tiếp theo)
-                            if idx not in tool_calls_acc:
+                            # Không có id → continuation chunk
+                            # Opus/Claude đôi khi gửi chunks không có id
+                            # → append vào tool call cuối cùng thay vì tạo mới
+                            if idx in tool_calls_acc:
+                                pass  # Append vào entry hiện tại theo index
+                            elif tool_calls_acc:
+                                # Fallback: append vào entry cuối cùng
+                                idx = max(tool_calls_acc.keys())
+                            else:
+                                # Chưa có entry nào → tạo mới (sẽ bị filter sau)
                                 tool_calls_acc[idx] = {
                                     "id": "",
                                     "type": "function",
@@ -1222,14 +1685,368 @@ class CopilotClient:
                                     pass  # Skip invalid fragments
                         else:
                             print(f"     {C.RED}[!] Tool '{tc_name}' invalid JSON args ({len(args_str)} chars): {repr(args_str[:300])}{C.RESET}")
-                            tc["function"]["arguments"] = "{}"
-                            tool_calls.append(tc)
+                            # Nếu args rỗng hoặc quá ngắn → Opus "ghost" tool call → bỏ qua
+                            # Chỉ fallback "{}" nếu args thực sự có nội dung nhưng JSON bị lỗi
+                            if len(args_str.strip()) > 2:
+                                tc["function"]["arguments"] = "{}"
+                                tool_calls.append(tc)
+                            else:
+                                print(f"     {C.RED}[!] Bỏ qua tool call rỗng (Opus ghost call){C.RESET}")
 
             return (full_content, tool_calls)
 
         except requests.exceptions.RequestException as e:
             print(f"{C.RED}[!] Lỗi kết nối: {e}{C.RESET}")
-            self.messages.pop()
+            # Chỉ pop nếu message cuối là user message (round đầu tiên)
+            # Nếu đang giữa tool loop, không pop để retry giữ nguyên context
+            if self.messages and self.messages[-1].get("role") == "user" and not any(
+                m.get("role") == "tool" for m in self.messages[-3:]
+            ):
+                self.messages.pop()
+            return None
+
+    # ─── Responses API (oswe-vscode-prime / Raptor Mini) ─────
+    def _build_responses_input(self, effective_system: str) -> list:
+        """Chuyển đổi self.messages (Chat format) sang Responses API input format.
+        
+        Chat Completions format:
+            {"role": "system", "content": "..."}
+            {"role": "user", "content": "..."}
+            {"role": "assistant", "content": "...", "tool_calls": [...]}
+            {"role": "tool", "tool_call_id": "...", "content": "..."}
+        
+        Responses API format:
+            {"role": "system", "content": [{"type": "input_text", "text": "..."}]}
+            {"role": "user", "content": [{"type": "input_text", "text": "..."}]}
+            {"role": "assistant", "content": [{"type": "output_text", "text": "..."}]}
+            {"type": "function_call", "name": "...", "arguments": "...", "call_id": "..."}
+            {"type": "function_call_output", "call_id": "...", "output": "..."}
+        """
+        input_items = []
+
+        # System message
+        input_items.append({
+            "role": "system",
+            "content": [{"type": "input_text", "text": effective_system}],
+        })
+
+        trimmed = self._trim_messages_for_context(self.messages)
+
+        for msg in trimmed:
+            role = msg.get("role", "")
+            content = msg.get("content") or ""
+
+            if role == "user":
+                input_items.append({
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": content}],
+                })
+
+            elif role == "assistant":
+                # Assistant message có thể có content và/hoặc tool_calls
+                if content:
+                    input_items.append({
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}],
+                    })
+
+                # Tool calls → function_call items
+                tool_calls = msg.get("tool_calls", [])
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    input_items.append({
+                        "type": "function_call",
+                        "name": func.get("name", ""),
+                        "arguments": func.get("arguments", "{}"),
+                        "call_id": tc.get("id", ""),
+                    })
+
+            elif role == "tool":
+                # Tool result → function_call_output
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id", ""),
+                    "output": content,
+                })
+
+        return input_items
+
+    def _send_responses_request(self, request_id=None, interaction_id=None, round_number=0):
+        """Gửi request sử dụng Responses API (POST /responses) và trả về (content, tool_calls)."""
+        # Build system prompt
+        effective_system = self.system_prompt
+
+        if self.mcp_manager and self.mcp_manager.servers:
+            tool_summary = {
+                "read_text_file": "Read file contents from disk",
+                "write_file": "Create or overwrite a file with content",
+                "edit_file": "Edit an existing file (partial changes)",
+                "list_directory": "List files/folders in a directory",
+                "search_files": "Search for files matching a pattern",
+                "fetch": "Fetch main content from a URL. Useful for summarizing or analyzing web pages or calling APIs. Use web_search first to find URLs, then fetch to read their content",
+                "execute_command": "Run shell commands (bash, python, curl, etc.)",
+                "web_search": "Search the web using DuckDuckGo (no API key needed). Returns results with title, URL, snippet. Use this to find current information, look up facts, or research topics",
+            }
+            tool_lines = []
+            for handle in self.mcp_manager.servers.values():
+                for tool in handle["tools"]:
+                    t_name = tool.get("name", "")
+                    if t_name in (self.mcp_manager.tool_map or {}):
+                        desc = tool_summary.get(t_name, "")
+                        tool_lines.append(f"- **{t_name}**: {desc}" if desc else f"- {t_name}")
+            if tool_lines:
+                effective_system += "\n\n## YOUR TOOLS\n" + "\n".join(tool_lines)
+
+        # Build input (Responses API format)
+        input_items = self._build_responses_input(effective_system)
+
+        body = {
+            "model": self.selected_model,
+            "input": input_items,
+            "stream": True,
+            "top_p": 1,
+            "max_output_tokens": 64000,
+            "store": False,
+            "truncation": "disabled",
+            "reasoning": {"summary": "detailed"},
+            "include": ["reasoning.encrypted_content"],
+        }
+
+        # Thêm tools nếu có MCP — convert sang Responses API flat format
+        if self.mcp_manager and self.mcp_manager.servers:
+            chat_tools = self.mcp_manager.get_openai_tools()
+            if chat_tools:
+                # Convert: {"type":"function","function":{"name":"x","description":"y","parameters":{...}}}
+                #      →   {"type":"function","name":"x","description":"y","parameters":{...},"strict":false}
+                responses_tools = []
+                for ct in chat_tools:
+                    func = ct.get("function", {})
+                    responses_tools.append({
+                        "type": "function",
+                        "name": func.get("name", ""),
+                        "description": func.get("description", ""),
+                        "parameters": func.get("parameters", {"type": "object", "properties": {}}),
+                        "strict": False,
+                    })
+                body["tools"] = responses_tools
+                body["tool_choice"] = "auto"
+
+        url = f"{self.api_base}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.copilot_token}",
+            "X-Request-Id": request_id or str(uuid.uuid4()),
+            "X-Interaction-Type": "conversation-agent",
+            "OpenAI-Intent": "conversation-agent",
+            "X-Interaction-Id": interaction_id or str(uuid.uuid4()),
+            "X-Initiator": "user" if round_number == 0 else "agent",
+            "VScode-SessionId": self.session_id,
+            "VScode-MachineId": self.machine_id,
+            "X-GitHub-Api-Version": COPILOT_API_VERSION,
+            "Editor-Plugin-Version": "copilot-chat/0.31.5",
+            "Editor-Version": "vscode/1.104.1",
+            "Copilot-Integration-Id": "vscode-chat",
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = self.session.post(url, headers=headers, json=body, stream=True, timeout=120)
+
+            if resp.status_code != 200:
+                err_text = resp.text[:500]
+                print(f"{C.RED}[!] Responses API thất bại (HTTP {resp.status_code}): {err_text}{C.RESET}")
+                self.messages.pop()
+                return None
+
+            resp.encoding = "utf-8"
+
+            # Parse SSE events từ Responses API
+            full_content = ""
+            showed_reasoning_header = False
+            buffer = ""
+            tool_calls = []  # list of {id, type, function: {name, arguments}}
+
+            # Accumulator cho function_call streaming
+            # Responses API gửi function_call dưới dạng output_item
+            current_function_calls = {}  # output_index -> {call_id, name, arguments}
+
+            for chunk_bytes in resp.iter_content(chunk_size=None):
+                if not chunk_bytes:
+                    continue
+
+                buffer += chunk_bytes.decode("utf-8", errors="replace")
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    # Responses API dùng "event:" và "data:" lines
+                    if line.startswith("event:"):
+                        continue  # Event type — xử lý qua data
+
+                    if not line.startswith("data:"):
+                        continue
+
+                    data_str = line[5:].strip()  # Bỏ "data:" (có thể "data: " hoặc "data:")
+
+                    if not data_str:
+                        continue
+
+                    try:
+                        event_data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    event_type = event_data.get("type", "")
+
+                    # ─── Text content delta ───
+                    if event_type == "response.output_text.delta":
+                        delta_text = event_data.get("delta", "")
+                        if delta_text:
+                            full_content += delta_text
+                            sys.stdout.write(delta_text)
+                            sys.stdout.flush()
+
+                    # ─── Reasoning (thinking) ───
+                    elif event_type == "response.reasoning.delta":
+                        if not showed_reasoning_header:
+                            print(f"\n{C.DIM}💭 Thinking...{C.RESET}")
+                            showed_reasoning_header = True
+
+                    # ─── Output item added (new message, function_call, reasoning) ───
+                    elif event_type == "response.output_item.added":
+                        item = event_data.get("item", {})
+                        item_type = item.get("type", "")
+                        output_idx = event_data.get("output_index", 0)
+
+                        if item_type == "function_call":
+                            # Bắt đầu function call mới
+                            current_function_calls[output_idx] = {
+                                "call_id": item.get("call_id", ""),
+                                "name": item.get("name", ""),
+                                "arguments": item.get("arguments", ""),
+                            }
+
+                        elif item_type == "reasoning":
+                            if not showed_reasoning_header:
+                                print(f"\n{C.DIM}💭 Thinking...{C.RESET}")
+                                showed_reasoning_header = True
+
+                    # ─── Function call argument delta ───
+                    elif event_type == "response.function_call_arguments.delta":
+                        output_idx = event_data.get("output_index", 0)
+                        delta_args = event_data.get("delta", "")
+                        if output_idx in current_function_calls and delta_args:
+                            current_function_calls[output_idx]["arguments"] += delta_args
+
+                    # ─── Function call done ───
+                    elif event_type == "response.function_call_arguments.done":
+                        output_idx = event_data.get("output_index", 0)
+                        if output_idx in current_function_calls:
+                            fc = current_function_calls[output_idx]
+                            # Finalize arguments if provided in done event
+                            final_args = event_data.get("arguments")
+                            if final_args is not None:
+                                fc["arguments"] = final_args
+
+                    # ─── Output item done (finalize) ───
+                    elif event_type == "response.output_item.done":
+                        item = event_data.get("item", {})
+                        item_type = item.get("type", "")
+                        output_idx = event_data.get("output_index", 0)
+
+                        if item_type == "function_call":
+                            # Có thể item chứa thông tin đầy đủ
+                            call_id = item.get("call_id", "")
+                            name = item.get("name", "")
+                            arguments = item.get("arguments", "")
+
+                            # Merge với accumulated data
+                            if output_idx in current_function_calls:
+                                fc = current_function_calls[output_idx]
+                                if not call_id:
+                                    call_id = fc.get("call_id", "")
+                                if not name:
+                                    name = fc.get("name", "")
+                                if not arguments:
+                                    arguments = fc.get("arguments", "")
+
+                            tool_calls.append({
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": arguments,
+                                },
+                            })
+
+                        elif item_type == "message":
+                            # Final message text — có thể extract full content
+                            msg_content = item.get("content", [])
+                            if msg_content and not full_content:
+                                for part in msg_content:
+                                    if part.get("type") == "output_text":
+                                        full_content = part.get("text", "")
+
+                    # ─── Response completed ───
+                    elif event_type == "response.completed":
+                        resp_data = event_data.get("response", {})
+                        # Extract full output nếu chưa có
+                        if not full_content and not tool_calls:
+                            for output_item in resp_data.get("output", []):
+                                if output_item.get("type") == "message":
+                                    for part in output_item.get("content", []):
+                                        if part.get("type") == "output_text":
+                                            text = part.get("text", "")
+                                            if text:
+                                                full_content = text
+                                                sys.stdout.write(text)
+                                                sys.stdout.flush()
+                        break
+
+            print()  # Newline sau khi stream xong
+
+            # Validate tool calls
+            validated_tool_calls = []
+            for tc in tool_calls:
+                args_str = tc["function"]["arguments"]
+                try:
+                    json.loads(args_str)
+                    validated_tool_calls.append(tc)
+                except (json.JSONDecodeError, TypeError):
+                    # Try split concatenated JSON
+                    split_objects = self._split_concat_json(args_str)
+                    if len(split_objects) > 1:
+                        print(f"     {C.YELLOW}[!] Tách {len(split_objects)} tool calls bị merge{C.RESET}")
+                        for i, obj_str in enumerate(split_objects):
+                            try:
+                                json.loads(obj_str)
+                                validated_tool_calls.append({
+                                    "id": tc["id"] + f"_split{i}" if i > 0 else tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["function"]["name"],
+                                        "arguments": obj_str,
+                                    },
+                                })
+                            except json.JSONDecodeError:
+                                pass
+                    else:
+                        print(f"     {C.RED}[!] Tool '{tc['function']['name']}' invalid JSON args: {repr(args_str[:300])}{C.RESET}")
+                        tc["function"]["arguments"] = "{}"
+                        validated_tool_calls.append(tc)
+
+            return (full_content, validated_tool_calls)
+
+        except requests.exceptions.RequestException as e:
+            print(f"{C.RED}[!] Lỗi kết nối: {e}{C.RESET}")
+            if self.messages and self.messages[-1].get("role") == "user" and not any(
+                m.get("role") == "tool" for m in self.messages[-3:]
+            ):
+                self.messages.pop()
             return None
 
     def clear_history(self):
@@ -1273,10 +2090,20 @@ class CopilotClient:
 
         for i, msg in enumerate(self.messages):
             role = msg["role"]
-            content = msg["content"]
+            content = msg.get("content") or ""
+
             if role == "user":
                 print(f"\n  {C.GREEN}👤 You:{C.RESET}")
+            elif role == "tool":
+                tool_name = msg.get("name", "tool")
+                print(f"\n  {C.MAGENTA}🔧 Tool ({tool_name}):{C.RESET}")
             else:
+                # assistant — có thể có tool_calls
+                tool_calls = msg.get("tool_calls")
+                if tool_calls and not content:
+                    names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+                    print(f"\n  {C.BLUE}🤖 Copilot → gọi tool: {', '.join(names)}{C.RESET}")
+                    continue
                 print(f"\n  {C.BLUE}🤖 Copilot:{C.RESET}")
 
             # Truncate nếu quá dài
@@ -1306,12 +2133,26 @@ def display_help():
   {C.YELLOW}/system reset{C.RESET}    Reset system prompt về mặc định
   {C.YELLOW}/clear{C.RESET}           Xóa lịch sử hội thoại
   {C.YELLOW}/history{C.RESET}         Xem lịch sử hội thoại
+
+  {C.BOLD}💾 Quản lý phiên:{C.RESET}
+  {C.YELLOW}/save [tên]{C.RESET}      Lưu phiên chat (tên tự động nếu bỏ trống)
+  {C.YELLOW}/load [số|tên]{C.RESET}   Load phiên chat đã lưu
+  {C.YELLOW}/sessions{C.RESET}        Xem danh sách phiên đã lưu
+  {C.YELLOW}/sessions rename <số> <tên>{C.RESET}  Đổi tên phiên
+  {C.YELLOW}/sessions delete <số>{C.RESET}        Xóa phiên
+
+  {C.BOLD}🔌 MCP Servers:{C.RESET}
   {C.YELLOW}/mcp{C.RESET}             Xem danh sách MCP tools đang kết nối
   {C.YELLOW}/mcp add <dir>{C.RESET}   Thêm thư mục vào MCP Filesystem Server
   {C.YELLOW}/mcp fetch{C.RESET}       Thêm MCP Fetch Server (tải web)
   {C.YELLOW}/mcp shell{C.RESET}       Thêm MCP Shell Server (chạy lệnh terminal)
+  {C.YELLOW}/mcp search{C.RESET}      Thêm Web Search (DuckDuckGo, không cần API)
+  {C.YELLOW}/mcp playwright{C.RESET}  Thêm Playwright Server (headless, mặc định)
+  {C.YELLOW}/mcp playwright headed{C.RESET}  Playwright có giao diện (hiện trình duyệt)
+  {C.YELLOW}/mcp web{C.RESET}         Thêm tất cả Web servers (search+fetch+playwright)
   {C.YELLOW}/mcp auto{C.RESET}        Tự động thêm tất cả MCP servers
   {C.YELLOW}/mcp stop{C.RESET}        Dừng tất cả MCP servers
+
   {C.YELLOW}/token{C.RESET}           Đổi GitHub token
   {C.YELLOW}/refresh{C.RESET}         Refresh Copilot token
   {C.YELLOW}/help{C.RESET}            Xem hướng dẫn này
@@ -1352,9 +2193,10 @@ def main():
     display_banner()
 
     client = CopilotClient()
+    session_mgr = SessionManager()
 
     # ─── Bước 1: Nhập GitHub Token ───
-    token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
+    token_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "token.txt")
     token = None
 
     if os.path.isfile(token_file):
@@ -1422,9 +2264,20 @@ def main():
     if default_model:
         client.select_model(default_model)
 
+    # ─── Bước 5: Khởi tạo MCP Filesystem Server ───
+    if client.mcp_manager:
+        cwd = os.getcwd()
+        print()
+        print(f"{C.BOLD}[Bước 5] Đang khởi tạo MCP Filesystem Server tại {cwd}...{C.RESET}")
+        if client.mcp_manager.add_filesystem_server([cwd]):
+            print(f"{C.GREEN}[+] Đã kết nối MCP Filesystem Server!{C.RESET}")
+        else:
+            print(f"{C.YELLOW}[!] Không thể khởi tạo MCP Filesystem Server.{C.RESET}")
+
     print()
     print(f"{C.DIM}  Gõ /help để xem hướng dẫn. Gõ /models để xem danh sách models.{C.RESET}")
     print(f"{C.DIM}  Gõ /select <số> hoặc /select <model_id> để chọn model khác.{C.RESET}")
+    print(f"{C.DIM}  Gõ /sessions để xem phiên cũ, /load <số> để tiếp tục phiên.{C.RESET}")
     print()
 
     # ─── Chat Loop ───
@@ -1469,6 +2322,34 @@ def main():
 
             elif cmd == "/history":
                 client.display_history()
+
+            elif cmd == "/save":
+                name = arg.strip() if arg.strip() else None
+                session_mgr.save(client, name)
+
+            elif cmd == "/load":
+                identifier = arg.strip() if arg.strip() else None
+                session_mgr.load(client, identifier)
+
+            elif cmd == "/sessions":
+                sub = arg.strip()
+                if sub.lower().startswith("rename"):
+                    # /sessions rename <số> <tên mới>
+                    rename_args = sub[6:].strip()
+                    rename_parts = rename_args.split(maxsplit=1)
+                    if len(rename_parts) < 2:
+                        print(f"{C.YELLOW}[!] Dùng: /sessions rename <số> <tên mới>{C.RESET}")
+                    else:
+                        session_mgr.rename(rename_parts[0], rename_parts[1])
+                elif sub.lower().startswith("delete") or sub.lower().startswith("del") or sub.lower().startswith("rm"):
+                    # /sessions delete <số|tên>
+                    del_arg = sub.split(maxsplit=1)
+                    if len(del_arg) < 2:
+                        print(f"{C.YELLOW}[!] Dùng: /sessions delete <số>{C.RESET}")
+                    else:
+                        session_mgr.delete(del_arg[1].strip())
+                else:
+                    session_mgr.display_sessions()
 
             elif cmd == "/system":
                 sub = arg.strip().lower()
@@ -1584,6 +2465,67 @@ def main():
                             print(f"{C.RED}[!] Không thể khởi động MCP Shell Server.{C.RESET}")
                             print(f"{C.DIM}    Cài: pip install mcp-server-shell{C.RESET}")
 
+                elif sub in ("playwright", "playwright headed", "playwright headless"):
+                    if not client.mcp_manager:
+                        print(f"{C.RED}[!] MCP module chưa được cài đặt.{C.RESET}")
+                    elif "playwright" in client.mcp_manager.servers:
+                        print(f"{C.YELLOW}[!] Playwright Server đã đang chạy.{C.RESET}")
+                        print(f"{C.DIM}    Dùng /mcp stop rồi chạy lại nếu muốn đổi chế độ.{C.RESET}")
+                    else:
+                        headless = sub != "playwright headed"
+                        mode_label = "headless (ẩn)" if headless else "headed (hiện trình duyệt)"
+                        print(f"{C.BOLD}[MCP] Đang khởi động Playwright Server ({mode_label})...{C.RESET}")
+                        if client.mcp_manager.add_playwright_server(headless=headless):
+                            print(f"{C.GREEN}[+] MCP Playwright Server đã kết nối! ({mode_label}){C.RESET}")
+                        else:
+                            print(f"{C.RED}[!] Không thể khởi động Playwright Server.{C.RESET}")
+                            print(f"{C.DIM}    Cài: npm install -g @playwright/mcp{C.RESET}")
+                            print(f"{C.DIM}    Và:  npx playwright install chromium{C.RESET}")
+
+                elif sub in ("search", "ddg", "duckduckgo"):
+                    if not client.mcp_manager:
+                        print(f"{C.RED}[!] MCP module chưa được cài đặt.{C.RESET}")
+                    elif "web_search" in client.mcp_manager.servers:
+                        print(f"{C.YELLOW}[!] Web Search đã đang hoạt động.{C.RESET}")
+                    else:
+                        print(f"{C.BOLD}[MCP] Đang kích hoạt Web Search (DuckDuckGo)...{C.RESET}")
+                        if client.mcp_manager.add_web_search():
+                            print(f"{C.GREEN}[+] Web Search đã sẵn sàng! (built-in, không cần server){C.RESET}")
+                        else:
+                            print(f"{C.RED}[!] Không thể kích hoạt Web Search.{C.RESET}")
+
+                elif sub == "web":
+                    # Shortcut: khởi động tất cả web tools (fetch + search + playwright)
+                    if not client.mcp_manager:
+                        print(f"{C.RED}[!] MCP module chưa được cài đặt.{C.RESET}")
+                    else:
+                        print(f"{C.BOLD}[MCP] Đang khởi động tất cả Web servers...{C.RESET}")
+                        # Web Search (built-in)
+                        if "web_search" not in client.mcp_manager.servers:
+                            print(f"  🔍 Web Search (DuckDuckGo)...", end=" ", flush=True)
+                            if client.mcp_manager.add_web_search():
+                                print(f"{C.GREEN}OK{C.RESET}")
+                            else:
+                                print(f"{C.RED}FAIL{C.RESET}")
+                        # Fetch
+                        if "fetch" not in client.mcp_manager.servers:
+                            print(f"  🌐 Fetch...", end=" ", flush=True)
+                            if client.mcp_manager.add_fetch_server():
+                                print(f"{C.GREEN}OK{C.RESET}")
+                            else:
+                                print(f"{C.RED}FAIL{C.RESET}")
+                        # Playwright
+                        if "playwright" not in client.mcp_manager.servers:
+                            print(f"  🎭 Playwright...", end=" ", flush=True)
+                            if client.mcp_manager.add_playwright_server():
+                                print(f"{C.GREEN}OK{C.RESET}")
+                            else:
+                                print(f"{C.YELLOW}SKIP (chưa cài){C.RESET}")
+                        print()
+                        client.mcp_manager.display_tools()
+                        n = len(client.mcp_manager.get_openai_tools())
+                        print(f"\n  {C.GREEN}Tổng cộng {n} web tools sẵn sàng.{C.RESET}\n")
+
                 elif sub == "auto":
                     if not client.mcp_manager:
                         print(f"{C.RED}[!] MCP module chưa được cài đặt.{C.RESET}")
@@ -1611,6 +2553,18 @@ def main():
                                 print(f"{C.GREEN}OK{C.RESET}")
                             else:
                                 print(f"{C.RED}FAIL{C.RESET}")
+                        # Web Search (built-in, luôn thành công)
+                        if "web_search" not in client.mcp_manager.servers:
+                            print(f"  🔍 Web Search (DuckDuckGo)...", end=" ", flush=True)
+                            client.mcp_manager.add_web_search()
+                            print(f"{C.GREEN}OK{C.RESET}")
+                        # Playwright
+                        if "playwright" not in client.mcp_manager.servers:
+                            print(f"  🎭 Playwright...", end=" ", flush=True)
+                            if client.mcp_manager.add_playwright_server():
+                                print(f"{C.GREEN}OK{C.RESET}")
+                            else:
+                                print(f"{C.YELLOW}SKIP{C.RESET}")
                         print()
                         client.mcp_manager.display_tools()
                         n = len(client.mcp_manager.get_openai_tools())
@@ -1637,6 +2591,9 @@ def main():
                     print(f"  {C.DIM}/mcp add <dir>  - Filesystem Server{C.RESET}")
                     print(f"  {C.DIM}/mcp fetch      - Fetch Server (tải web){C.RESET}")
                     print(f"  {C.DIM}/mcp shell      - Shell Server (terminal){C.RESET}")
+                    print(f"  {C.DIM}/mcp search     - Web Search (DuckDuckGo){C.RESET}")
+                    print(f"  {C.DIM}/mcp playwright  - Playwright (trình duyệt){C.RESET}")
+                    print(f"  {C.DIM}/mcp web        - Tất cả web servers{C.RESET}")
                     print(f"  {C.DIM}/mcp auto       - Tất cả servers{C.RESET}")
                     print()
 
@@ -1655,6 +2612,14 @@ def main():
         print(f"{C.BLUE}🤖 Copilot:{C.RESET}")
         client.chat(user_input)
         print()
+
+    # Auto-save phiên khi thoát (nếu có lịch sử chat)
+    if client.messages:
+        try:
+            print(f"{C.DIM}[*] Tự động lưu phiên...{C.RESET}")
+            session_mgr.save(client)
+        except Exception:
+            pass
 
     # Cleanup MCP servers
     if client.mcp_manager:
