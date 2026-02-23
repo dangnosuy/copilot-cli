@@ -1,7 +1,6 @@
-requests>=2.31.0
-mcp>=1.2.0
-cryptography>=41.0.0
-readabilipy>=0.2.0
-mcp-server-filesystem
-mcp-server-fetch
-mcp-server-shell
+requests>=2.31.0        
+mcp>=1.2.0              
+mcp-server-fetch>=2025.1.0  
+mcp-server-shell>=0.1.0    
+ddgs>=9.0.0               
+readabilipy>=0.2.0        
