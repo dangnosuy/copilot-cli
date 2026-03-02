@@ -1492,7 +1492,7 @@ class CopilotClient:
             "X-Interaction-Type": "conversation-agent",
             "OpenAI-Intent": "conversation-agent",
             "X-Interaction-Id": interaction_id or str(uuid.uuid4()),
-            "X-Initiator": "user" if round_number == 0 else "agent",
+            "X-Initiator": "agent",
             "VScode-SessionId": self.session_id,
             "VScode-MachineId": self.machine_id,
             "X-GitHub-Api-Version": COPILOT_API_VERSION,
@@ -1838,7 +1838,7 @@ class CopilotClient:
             "X-Interaction-Type": "conversation-agent",
             "OpenAI-Intent": "conversation-agent",
             "X-Interaction-Id": interaction_id or str(uuid.uuid4()),
-            "X-Initiator": "user" if round_number == 0 else "agent",
+            "X-Initiator": "agent",
             "VScode-SessionId": self.session_id,
             "VScode-MachineId": self.machine_id,
             "X-GitHub-Api-Version": COPILOT_API_VERSION,
@@ -2287,7 +2287,15 @@ def main():
             model_label = client.selected_model or "no-model"
             prompt_str = f"{C.BOLD}{C.GREEN}[{model_label}]{C.RESET} {C.BOLD}>{C.RESET} "
             user_input = _smart_input(prompt_str).strip()
-        except (KeyboardInterrupt, EOFError):
+        except KeyboardInterrupt:
+            print(f"\n{C.DIM}(Ctrl+C lần nữa để thoát){C.RESET}")
+            try:
+                _smart_input("").strip()
+            except (KeyboardInterrupt, EOFError):
+                print(f"\n{C.GREEN}[+] Bye! 👋{C.RESET}")
+                break
+            continue
+        except EOFError:
             print(f"\n{C.GREEN}[+] Bye! 👋{C.RESET}")
             break
 
@@ -2610,7 +2618,10 @@ def main():
 
         print()
         print(f"{C.BLUE}🤖 Copilot:{C.RESET}")
-        client.chat(user_input)
+        try:
+            client.chat(user_input)
+        except KeyboardInterrupt:
+            print(f"\n{C.YELLOW}[⏹] Đã dừng response.{C.RESET}")
         print()
 
     # Auto-save phiên khi thoát (nếu có lịch sử chat)
