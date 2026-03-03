@@ -109,6 +109,293 @@ def resolve_model(model_name: str) -> str:
 
     return model_name
 
+
+# ═══════════════════════════════════════════════════════════════
+# MODEL PROMPT LIMITS — max_prompt_tokens per Copilot model
+# Loaded from models_with_billing.json or fallback defaults
+# ═══════════════════════════════════════════════════════════════
+_MODEL_PROMPT_LIMITS: Dict[str, int] = {}
+
+
+def _load_model_limits():
+    """Load max_prompt_tokens from models_with_billing.json."""
+    global _MODEL_PROMPT_LIMITS
+    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models_with_billing.json")
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+        for m in data.get("data", []):
+            model_id = m.get("id", "")
+            limits = m.get("capabilities", {}).get("limits", {})
+            max_prompt = limits.get("max_prompt_tokens")
+            if model_id and max_prompt:
+                _MODEL_PROMPT_LIMITS[model_id] = max_prompt
+    except Exception as e:
+        print(f"  ⚠ Could not load model limits: {e}")
+
+    # Hardcoded fallbacks for common Claude models
+    fallbacks = {
+        "claude-opus-4.6": 128000,
+        "claude-opus-4.5": 128000,
+        "claude-sonnet-4.6": 128000,
+        "claude-sonnet-4.5": 128000,
+        "claude-sonnet-4": 128000,
+        "claude-haiku-4.5": 128000,
+    }
+    for k, v in fallbacks.items():
+        _MODEL_PROMPT_LIMITS.setdefault(k, v)
+
+
+# Load on import
+_load_model_limits()
+
+
+def get_model_prompt_limit(model_id: str) -> int:
+    """Get max_prompt_tokens for a model. Default 128000."""
+    return _MODEL_PROMPT_LIMITS.get(model_id, 128000)
+
+
+# ═══════════════════════════════════════════════════════════════
+# TOKEN ESTIMATION & MESSAGE TRUNCATION
+# Strategy (same as GitHub Copilot CLI):
+#   1. Estimate total tokens
+#   2. If over limit → Pass 1: truncate old tool_result content
+#   3. If still over → Pass 2: drop oldest conversation turns
+#      (keep system + first user msg + marker + last N messages)
+# ═══════════════════════════════════════════════════════════════
+
+def _estimate_tokens_text(text: str) -> int:
+    """Estimate token count. Conservative: ~3 chars per token."""
+    if not text:
+        return 0
+    return len(text) // 3
+
+
+def _estimate_anthropic_message_tokens(msg: dict) -> int:
+    """Estimate tokens for one Anthropic-format message."""
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return _estimate_tokens_text(content)
+
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            btype = block.get("type", "")
+            if btype == "text":
+                total += _estimate_tokens_text(block.get("text", ""))
+            elif btype == "tool_use":
+                total += _estimate_tokens_text(block.get("name", ""))
+                total += _estimate_tokens_text(json.dumps(block.get("input", {})))
+            elif btype == "tool_result":
+                inner = block.get("content", "")
+                if isinstance(inner, str):
+                    total += _estimate_tokens_text(inner)
+                elif isinstance(inner, list):
+                    for ib in inner:
+                        if ib.get("type") == "text":
+                            total += _estimate_tokens_text(ib.get("text", ""))
+            elif btype == "image":
+                total += 1000  # rough estimate for images
+            else:
+                total += _estimate_tokens_text(json.dumps(block))
+        return total
+
+    return 0
+
+
+def _estimate_system_tokens(system) -> int:
+    """Estimate tokens for the system prompt."""
+    if isinstance(system, str):
+        return _estimate_tokens_text(system)
+    if isinstance(system, list):
+        return sum(_estimate_tokens_text(b.get("text", "")) for b in system if b.get("type") == "text")
+    return 0
+
+
+def _estimate_tools_tokens(tools: list) -> int:
+    """Estimate tokens for tool definitions."""
+    if not tools:
+        return 0
+    return _estimate_tokens_text(json.dumps(tools))
+
+
+def _truncate_tool_result_content(block: dict, max_chars: int = 500) -> dict:
+    """Truncate a tool_result content block if too long."""
+    inner = block.get("content", "")
+    if isinstance(inner, str) and len(inner) > max_chars * 1.5:
+        block = dict(block)
+        block["content"] = inner[:max_chars] + "\n... [truncated for context] ..."
+        return block
+    if isinstance(inner, list):
+        new_inner = []
+        for ib in inner:
+            if ib.get("type") == "text":
+                text = ib.get("text", "")
+                if len(text) > max_chars * 1.5:
+                    ib = dict(ib)
+                    ib["text"] = text[:max_chars] + "\n... [truncated for context] ..."
+            new_inner.append(ib)
+        block = dict(block)
+        block["content"] = new_inner
+        return block
+    return block
+
+
+def truncate_messages_for_context(
+    messages: list,
+    system,
+    tools: list,
+    max_prompt_tokens: int,
+) -> tuple:
+    """Truncate Anthropic messages to fit within max_prompt_tokens.
+    
+    Returns (truncated_messages, was_truncated, stats_dict).
+    
+    Algorithm (3 passes, inspired by GitHub Copilot):
+      Pass 0: Check if already within limit → return as-is
+      Pass 1: Truncate old tool_result content (keep last 10 msgs intact)
+      Pass 2: Drop oldest conversation turns (keep first user + last N msgs)
+    """
+    # Reserve tokens for system + tools + overhead
+    system_tokens = _estimate_system_tokens(system)
+    tools_tokens = _estimate_tools_tokens(tools)
+    overhead = 500  # safety margin for formatting, etc.
+    available = max_prompt_tokens - system_tokens - tools_tokens - overhead
+
+    if available <= 0:
+        available = max_prompt_tokens // 2  # fallback
+
+    # Calculate total message tokens
+    msg_tokens = [_estimate_anthropic_message_tokens(m) for m in messages]
+    total = sum(msg_tokens)
+
+    stats = {
+        "total_estimated": total + system_tokens + tools_tokens,
+        "max_prompt_tokens": max_prompt_tokens,
+        "system_tokens": system_tokens,
+        "tools_tokens": tools_tokens,
+        "available_for_messages": available,
+        "original_count": len(messages),
+        "truncated": False,
+        "pass": 0,
+    }
+
+    if total <= available:
+        return messages, False, stats
+
+    # ─── Pass 1: Truncate old tool_result content ───
+    # Keep last 10 messages intact, truncate tool_results in older messages
+    result = list(messages)
+    safe_zone = min(10, len(result))  # don't touch last N messages
+
+    for i in range(len(result) - safe_zone):
+        msg = result[i]
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        new_content = []
+        changed = False
+        for block in content:
+            if block.get("type") == "tool_result":
+                truncated_block = _truncate_tool_result_content(block, max_chars=500)
+                if truncated_block is not block:
+                    changed = True
+                new_content.append(truncated_block)
+            elif block.get("type") == "tool_use":
+                # Also truncate large tool_use inputs in old messages
+                inp = block.get("input", {})
+                inp_str = json.dumps(inp)
+                if len(inp_str) > 1000:
+                    block = dict(block)
+                    try:
+                        block["input"] = json.loads(inp_str[:800] + "}")
+                    except json.JSONDecodeError:
+                        block["input"] = {"_truncated": inp_str[:800]}
+                    changed = True
+                new_content.append(block)
+            else:
+                # Truncate very long text blocks in old messages
+                if block.get("type") == "text" and len(block.get("text", "")) > 2000:
+                    block = dict(block)
+                    block["text"] = block["text"][:1500] + "\n... [truncated for context] ..."
+                    changed = True
+                new_content.append(block)
+
+        if changed:
+            result[i] = dict(msg)
+            result[i]["content"] = new_content
+
+    # Also truncate old string content messages
+    for i in range(len(result) - safe_zone):
+        msg = result[i]
+        content = msg.get("content")
+        if isinstance(content, str) and len(content) > 3000:
+            result[i] = dict(msg)
+            result[i]["content"] = content[:2000] + "\n... [truncated for context] ..."
+
+    # Recalculate
+    msg_tokens = [_estimate_anthropic_message_tokens(m) for m in result]
+    total = sum(msg_tokens)
+
+    if total <= available:
+        stats["truncated"] = True
+        stats["pass"] = 1
+        stats["final_count"] = len(result)
+        stats["final_estimated"] = total + system_tokens + tools_tokens
+        return result, True, stats
+
+    # ─── Pass 2: Drop oldest conversation turns ───
+    # Keep: first user message + truncation marker + last N messages
+    # N is adaptive: start with 40, reduce until fits
+    for keep_last in (40, 30, 20, 15, 10, 5):
+        if len(result) <= keep_last + 2:
+            continue
+
+        # Find valid cut point — don't break in the middle of a tool call sequence
+        # (tool_result must follow its tool_use in assistant message)
+        cut_end = len(result) - keep_last
+        
+        # Make sure we don't cut right before a tool_result (role=user with tool_result content)
+        # Walk backwards to find a safe cut point
+        while cut_end > 1:
+            msg = result[cut_end]
+            content = msg.get("content")
+            is_tool_result = False
+            if isinstance(content, list):
+                is_tool_result = any(b.get("type") == "tool_result" for b in content)
+            if msg.get("role") == "tool" or is_tool_result:
+                cut_end -= 1  # don't break tool call chain
+            else:
+                break
+
+        first_msg = result[0]
+        truncation_marker = {
+            "role": "user",
+            "content": "[... earlier conversation truncated to fit context window ...]"
+        }
+        kept_msgs = [first_msg, truncation_marker] + result[cut_end:]
+
+        kept_total = sum(_estimate_anthropic_message_tokens(m) for m in kept_msgs)
+        if kept_total <= available:
+            stats["truncated"] = True
+            stats["pass"] = 2
+            stats["dropped_messages"] = cut_end - 1
+            stats["final_count"] = len(kept_msgs)
+            stats["final_estimated"] = kept_total + system_tokens + tools_tokens
+            return kept_msgs, True, stats
+
+    # ─── Pass 3 (emergency): Keep only last 5 messages ───
+    emergency = [
+        {"role": "user", "content": "[Context truncated due to length. Previous conversation was dropped.]"},
+    ] + result[-5:]
+    stats["truncated"] = True
+    stats["pass"] = 3
+    stats["final_count"] = len(emergency)
+    stats["final_estimated"] = sum(_estimate_anthropic_message_tokens(m) for m in emergency) + system_tokens + tools_tokens
+    return emergency, True, stats
+
+
 # ═══════════════════════════════════════════════════════════════
 # SESSION CACHE  (github_token -> (copilot_token, api_base, expires_at))
 # ═══════════════════════════════════════════════════════════════
@@ -665,15 +952,37 @@ async def create_message(request: Request):
     model_requested = body.get("model", "")
     is_stream = body.get("stream", False)
 
+    # ─── Smart Truncation: fit messages within Copilot's max_prompt_tokens ───
+    resolved = resolve_model(model_requested)
+    max_prompt = get_model_prompt_limit(resolved)
+
+    truncated_messages, was_truncated, trunc_stats = truncate_messages_for_context(
+        messages=body.get("messages", []),
+        system=body.get("system"),
+        tools=body.get("tools", []),
+        max_prompt_tokens=max_prompt,
+    )
+
+    if was_truncated:
+        # Replace messages in body with truncated version
+        body = dict(body)
+        body["messages"] = truncated_messages
+        print(f"\n  ⚡ Context truncated (pass {trunc_stats['pass']}): "
+              f"{trunc_stats['original_count']} → {trunc_stats['final_count']} messages | "
+              f"~{trunc_stats.get('total_estimated', 0):,} → ~{trunc_stats.get('final_estimated', 0):,} tokens "
+              f"(limit: {max_prompt:,})")
+        if trunc_stats.get("dropped_messages"):
+            print(f"  ⚡ Dropped {trunc_stats['dropped_messages']} old messages")
+
     # Convert Anthropic request → OpenAI format
     openai_body = anthropic_to_openai_request(body)
 
     # Log model mapping
-    resolved = resolve_model(model_requested)
     if resolved != model_requested:
-        print(f"  ↳ Model mapped: {model_requested} → {resolved}")
+        print(f"\n  ↳ Model mapped: {model_requested} → {resolved}")
     else:
-        print(f"  ↳ Model: {resolved}")
+        print(f"\n  ↳ Model: {resolved}")
+    print(f"  ↳ Stream: {is_stream} | max_tokens: {body.get('max_tokens', 'N/A')} | messages: {len(body.get('messages', []))} | prompt_limit: {max_prompt:,}")
 
     # Billing bypass: inject fake tools nếu request có tools
     if openai_body.get("tools"):
@@ -701,7 +1010,8 @@ async def create_message(request: Request):
                     async with client.stream("POST", url, headers=headers, json=openai_body, timeout=120) as resp:
                         if resp.status_code != 200:
                             err_bytes = await resp.aread()
-                            err_msg = err_bytes.decode("utf-8", errors="replace")[:300]
+                            err_msg = err_bytes.decode("utf-8", errors="replace")[:500]
+                            print(f"  ✗ Upstream error (stream) HTTP {resp.status_code}: {err_msg}")
                             yield _sse_event("error", {
                                 "type": "error",
                                 "error": {
@@ -864,8 +1174,10 @@ async def create_message(request: Request):
 
                         # ─── message_stop ───
                         yield _sse_event("message_stop", {"type": "message_stop"})
+                        print(f"  ✓ Stream complete | stop_reason: {stop_reason} | usage: in={usage_data['input_tokens']} out={usage_data['output_tokens']}")
 
                 except httpx.ReadTimeout:
+                    print(f"  ✗ Request timeout (stream)")
                     yield _sse_event("error", {
                         "type": "error",
                         "error": {"type": "api_error", "message": "Request timeout"}
@@ -888,17 +1200,21 @@ async def create_message(request: Request):
         if resp.status_code != 200:
             try:
                 err = resp.json()
-                err_msg = err.get("error", {}).get("message", resp.text[:300])
+                err_msg = err.get("error", {}).get("message", resp.text[:500])
             except Exception:
-                err_msg = resp.text[:300]
+                err_msg = resp.text[:500]
+            print(f"  ✗ Upstream error HTTP {resp.status_code}: {err_msg}")
             raise HTTPException(status_code=resp.status_code, detail={
                 "type": "error",
                 "error": {"type": "api_error", "message": err_msg}
             })
 
         raw = resp.json()
+        anthropic_resp = openai_to_anthropic_response(raw, model_requested)
+        usage = anthropic_resp.get("usage", {})
+        print(f"  ✓ Response OK | stop_reason: {anthropic_resp.get('stop_reason')} | usage: in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}")
         return JSONResponse(
-            content=openai_to_anthropic_response(raw, model_requested),
+            content=anthropic_resp,
             headers={"anthropic-version": "2023-06-01"},
         )
 
