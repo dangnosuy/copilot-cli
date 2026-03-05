@@ -112,7 +112,7 @@ def resolve_model(model_name: str) -> str:
 
 # ═══════════════════════════════════════════════════════════════
 # MODEL PROMPT LIMITS — max_prompt_tokens per Copilot model
-# Loaded from models_with_billing.json or fallback defaults
+# Loaded from models_with_billing.json at startup
 # ═══════════════════════════════════════════════════════════════
 _MODEL_PROMPT_LIMITS: Dict[str, int] = {}
 
@@ -133,20 +133,15 @@ def _load_model_limits():
     except Exception as e:
         print(f"  ⚠ Could not load model limits: {e}")
 
-    # Hardcoded fallbacks for common Claude models
-    fallbacks = {
-        "claude-opus-4.6": 128000,
-        "claude-opus-4.5": 128000,
-        "claude-sonnet-4.6": 128000,
-        "claude-sonnet-4.5": 128000,
-        "claude-sonnet-4": 128000,
-        "claude-haiku-4.5": 128000,
-    }
-    for k, v in fallbacks.items():
+    # Hardcoded fallbacks
+    for k, v in {
+        "claude-opus-4.6": 128000, "claude-opus-4.5": 128000,
+        "claude-sonnet-4.6": 128000, "claude-sonnet-4.5": 128000,
+        "claude-sonnet-4": 128000, "claude-haiku-4.5": 128000,
+    }.items():
         _MODEL_PROMPT_LIMITS.setdefault(k, v)
 
 
-# Load on import
 _load_model_limits()
 
 
@@ -157,12 +152,20 @@ def get_model_prompt_limit(model_id: str) -> int:
 
 # ═══════════════════════════════════════════════════════════════
 # TOKEN ESTIMATION & MESSAGE TRUNCATION
-# Strategy (same as GitHub Copilot CLI):
-#   1. Estimate total tokens
-#   2. If over limit → Pass 1: truncate old tool_result content
-#   3. If still over → Pass 2: drop oldest conversation turns
-#      (keep system + first user msg + marker + last N messages)
+# Strategy (inspired by GitHub Copilot CLI):
+#   Pass 0: Check if within limit → return as-is
+#   Pass 1: Truncate old tool_result / long text content
+#   Pass 2: Drop oldest conversation turns (keep first + last N)
+#   Pass 3: Emergency — keep only last 5 messages
+#
+# KEY INSIGHT: Our token estimate (~3 chars/token) is rough.
+# Copilot uses real tokenizer which may count MORE tokens.
+# So we use a safety margin (0.85x) to avoid edge cases where
+# our estimate says "OK" but Copilot says "too many".
 # ═══════════════════════════════════════════════════════════════
+
+SAFETY_MARGIN = 0.85  # Use only 85% of max_prompt_tokens to account for estimation error
+
 
 def _estimate_tokens_text(text: str) -> int:
     """Estimate token count. Conservative: ~3 chars per token."""
@@ -224,19 +227,22 @@ def _truncate_tool_result_content(block: dict, max_chars: int = 500) -> dict:
     inner = block.get("content", "")
     if isinstance(inner, str) and len(inner) > max_chars * 1.5:
         block = dict(block)
-        block["content"] = inner[:max_chars] + "\n... [truncated for context] ..."
+        block["content"] = inner[:max_chars] + "\n... [truncated] ..."
         return block
     if isinstance(inner, list):
         new_inner = []
+        changed = False
         for ib in inner:
             if ib.get("type") == "text":
                 text = ib.get("text", "")
                 if len(text) > max_chars * 1.5:
                     ib = dict(ib)
-                    ib["text"] = text[:max_chars] + "\n... [truncated for context] ..."
+                    ib["text"] = text[:max_chars] + "\n... [truncated] ..."
+                    changed = True
             new_inner.append(ib)
-        block = dict(block)
-        block["content"] = new_inner
+        if changed:
+            block = dict(block)
+            block["content"] = new_inner
         return block
     return block
 
@@ -248,22 +254,20 @@ def truncate_messages_for_context(
     max_prompt_tokens: int,
 ) -> tuple:
     """Truncate Anthropic messages to fit within max_prompt_tokens.
-    
+
     Returns (truncated_messages, was_truncated, stats_dict).
-    
-    Algorithm (3 passes, inspired by GitHub Copilot):
-      Pass 0: Check if already within limit → return as-is
-      Pass 1: Truncate old tool_result content (keep last 10 msgs intact)
-      Pass 2: Drop oldest conversation turns (keep first user + last N msgs)
     """
+    # Apply safety margin — our estimate is rough, real tokenizer counts more
+    effective_limit = int(max_prompt_tokens * SAFETY_MARGIN)
+
     # Reserve tokens for system + tools + overhead
     system_tokens = _estimate_system_tokens(system)
     tools_tokens = _estimate_tools_tokens(tools)
-    overhead = 500  # safety margin for formatting, etc.
-    available = max_prompt_tokens - system_tokens - tools_tokens - overhead
+    overhead = 500  # formatting overhead
+    available = effective_limit - system_tokens - tools_tokens - overhead
 
     if available <= 0:
-        available = max_prompt_tokens // 2  # fallback
+        available = effective_limit // 2
 
     # Calculate total message tokens
     msg_tokens = [_estimate_anthropic_message_tokens(m) for m in messages]
@@ -272,6 +276,7 @@ def truncate_messages_for_context(
     stats = {
         "total_estimated": total + system_tokens + tools_tokens,
         "max_prompt_tokens": max_prompt_tokens,
+        "effective_limit": effective_limit,
         "system_tokens": system_tokens,
         "tools_tokens": tools_tokens,
         "available_for_messages": available,
@@ -283,27 +288,33 @@ def truncate_messages_for_context(
     if total <= available:
         return messages, False, stats
 
-    # ─── Pass 1: Truncate old tool_result content ───
-    # Keep last 10 messages intact, truncate tool_results in older messages
+    # ─── Pass 1: Truncate old tool_result / long text content ───
     result = list(messages)
-    safe_zone = min(10, len(result))  # don't touch last N messages
+    safe_zone = min(10, len(result))
 
     for i in range(len(result) - safe_zone):
         msg = result[i]
         content = msg.get("content")
+
+        # Truncate long string content in old messages
+        if isinstance(content, str) and len(content) > 2000:
+            result[i] = dict(msg)
+            result[i]["content"] = content[:1500] + "\n... [truncated] ..."
+            continue
+
         if not isinstance(content, list):
             continue
 
         new_content = []
         changed = False
         for block in content:
-            if block.get("type") == "tool_result":
-                truncated_block = _truncate_tool_result_content(block, max_chars=500)
-                if truncated_block is not block:
+            btype = block.get("type", "")
+            if btype == "tool_result":
+                new_block = _truncate_tool_result_content(block, max_chars=500)
+                if new_block is not block:
                     changed = True
-                new_content.append(truncated_block)
-            elif block.get("type") == "tool_use":
-                # Also truncate large tool_use inputs in old messages
+                new_content.append(new_block)
+            elif btype == "tool_use":
                 inp = block.get("input", {})
                 inp_str = json.dumps(inp)
                 if len(inp_str) > 1000:
@@ -314,29 +325,20 @@ def truncate_messages_for_context(
                         block["input"] = {"_truncated": inp_str[:800]}
                     changed = True
                 new_content.append(block)
+            elif btype == "text" and len(block.get("text", "")) > 2000:
+                block = dict(block)
+                block["text"] = block["text"][:1500] + "\n... [truncated] ..."
+                changed = True
+                new_content.append(block)
             else:
-                # Truncate very long text blocks in old messages
-                if block.get("type") == "text" and len(block.get("text", "")) > 2000:
-                    block = dict(block)
-                    block["text"] = block["text"][:1500] + "\n... [truncated for context] ..."
-                    changed = True
                 new_content.append(block)
 
         if changed:
             result[i] = dict(msg)
             result[i]["content"] = new_content
 
-    # Also truncate old string content messages
-    for i in range(len(result) - safe_zone):
-        msg = result[i]
-        content = msg.get("content")
-        if isinstance(content, str) and len(content) > 3000:
-            result[i] = dict(msg)
-            result[i]["content"] = content[:2000] + "\n... [truncated for context] ..."
-
     # Recalculate
-    msg_tokens = [_estimate_anthropic_message_tokens(m) for m in result]
-    total = sum(msg_tokens)
+    total = sum(_estimate_anthropic_message_tokens(m) for m in result)
 
     if total <= available:
         stats["truncated"] = True
@@ -346,18 +348,12 @@ def truncate_messages_for_context(
         return result, True, stats
 
     # ─── Pass 2: Drop oldest conversation turns ───
-    # Keep: first user message + truncation marker + last N messages
-    # N is adaptive: start with 40, reduce until fits
     for keep_last in (40, 30, 20, 15, 10, 5):
         if len(result) <= keep_last + 2:
             continue
 
-        # Find valid cut point — don't break in the middle of a tool call sequence
-        # (tool_result must follow its tool_use in assistant message)
+        # Find safe cut point — don't break tool call chains
         cut_end = len(result) - keep_last
-        
-        # Make sure we don't cut right before a tool_result (role=user with tool_result content)
-        # Walk backwards to find a safe cut point
         while cut_end > 1:
             msg = result[cut_end]
             content = msg.get("content")
@@ -365,7 +361,7 @@ def truncate_messages_for_context(
             if isinstance(content, list):
                 is_tool_result = any(b.get("type") == "tool_result" for b in content)
             if msg.get("role") == "tool" or is_tool_result:
-                cut_end -= 1  # don't break tool call chain
+                cut_end -= 1
             else:
                 break
 
@@ -387,7 +383,7 @@ def truncate_messages_for_context(
 
     # ─── Pass 3 (emergency): Keep only last 5 messages ───
     emergency = [
-        {"role": "user", "content": "[Context truncated due to length. Previous conversation was dropped.]"},
+        {"role": "user", "content": "[Context truncated. Previous conversation dropped.]"},
     ] + result[-5:]
     stats["truncated"] = True
     stats["pass"] = 3
@@ -964,20 +960,19 @@ async def create_message(request: Request):
     )
 
     if was_truncated:
-        # Replace messages in body with truncated version
         body = dict(body)
         body["messages"] = truncated_messages
         print(f"\n  ⚡ Context truncated (pass {trunc_stats['pass']}): "
               f"{trunc_stats['original_count']} → {trunc_stats['final_count']} messages | "
-              f"~{trunc_stats.get('total_estimated', 0):,} → ~{trunc_stats.get('final_estimated', 0):,} tokens "
-              f"(limit: {max_prompt:,})")
+              f"~{trunc_stats.get('total_estimated', 0):,} → ~{trunc_stats.get('final_estimated', 0):,} est. tokens "
+              f"(limit: {max_prompt:,}, effective: {trunc_stats['effective_limit']:,})")
         if trunc_stats.get("dropped_messages"):
             print(f"  ⚡ Dropped {trunc_stats['dropped_messages']} old messages")
 
-    # Convert Anthropic request → OpenAI format
+    # Convert Anthropic request → OpenAI format (AFTER truncation)
     openai_body = anthropic_to_openai_request(body)
 
-    # Log model mapping
+    # Log
     if resolved != model_requested:
         print(f"\n  ↳ Model mapped: {model_requested} → {resolved}")
     else:
