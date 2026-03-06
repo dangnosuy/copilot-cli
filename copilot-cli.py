@@ -92,6 +92,16 @@ USER_AGENT = "GitHubCopilotChat/0.31.5"
 # Models sử dụng Responses API (POST /responses) thay vì Chat Completions API (POST /chat/completions)
 RESPONSES_API_MODELS = {"oswe-vscode-prime"}
 
+# GPT Codex models — cũng dùng Responses API nhưng với max_output_tokens lớn hơn
+GPT_CODEX_RESPONSES_MODELS = {
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.4",
+}
+
 # Sessions directory
 SESSIONS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "sessions")
 
@@ -1782,7 +1792,22 @@ class CopilotClient:
 
     def _is_responses_api(self) -> bool:
         """Kiểm tra model hiện tại có dùng Responses API không."""
-        return self.selected_model in RESPONSES_API_MODELS
+        if self.selected_model in RESPONSES_API_MODELS or self.selected_model in GPT_CODEX_RESPONSES_MODELS:
+            return True
+        # Prefix matching cho các model có date suffix (vd: gpt-5.4-2026-03-05)
+        for prefix in GPT_CODEX_RESPONSES_MODELS:
+            if self.selected_model.startswith(prefix):
+                return True
+        return False
+
+    def _is_gpt_codex_model(self) -> bool:
+        """Kiểm tra model có phải GPT Codex (max_output_tokens lớn hơn) không."""
+        if self.selected_model in GPT_CODEX_RESPONSES_MODELS:
+            return True
+        for prefix in GPT_CODEX_RESPONSES_MODELS:
+            if self.selected_model.startswith(prefix):
+                return True
+        return False
 
     def _send_chat_request(self, request_id=None, interaction_id=None, round_number=0):
         """Gửi một request chat và trả về (content, tool_calls) hoặc None nếu lỗi."""
@@ -2087,7 +2112,7 @@ class CopilotClient:
                 self.messages.pop()
             return None
 
-    # ─── Responses API (oswe-vscode-prime / Raptor Mini) ─────
+    # ─── Responses API (oswe-vscode-prime / GPT Codex) ─────
     def _build_responses_input(self, effective_system: str) -> list:
         """Chuyển đổi self.messages (Chat format) sang Responses API input format.
 
@@ -2129,6 +2154,7 @@ class CopilotClient:
                 if content:
                     input_items.append({
                         "role": "assistant",
+                        "type": "message",
                         "content": [{"type": "output_text", "text": content}],
                     })
 
@@ -2187,7 +2213,7 @@ class CopilotClient:
             "input": input_items,
             "stream": True,
             "top_p": 1,
-            "max_output_tokens": 64000,
+            "max_output_tokens": 128000 if self._is_gpt_codex_model() else 64000,
             "store": False,
             "truncation": "disabled",
             "reasoning": {"summary": "detailed"},
