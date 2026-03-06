@@ -62,6 +62,23 @@ try:
 except ImportError:
     MCPManager = None
 
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.spinner import Spinner
+    from rich.syntax import Syntax
+    from rich.text import Text
+    from rich.table import Table
+    from rich.rule import Rule
+    import difflib
+    console = Console()
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+    console = None
+
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -91,6 +108,11 @@ class C:
     CYAN    = "\033[96m"
     WHITE   = "\033[97m"
 
+DANGEROUS_TOOLS = {"execute_command", "write_file", "edit_file"}
+
+# /yolo mode — auto-approve all tool calls without permission prompts
+yolo_mode = False
+
 
 # ═══════════════════════════════════════════════════════════════
 # SMART INPUT — Inline autocomplete cho / commands
@@ -107,7 +129,7 @@ SLASH_COMMANDS = [
     "/mcp", "/mcp add", "/mcp fetch", "/mcp shell",
     "/mcp auto", "/mcp stop", "/mcp search", "/mcp playwright",
     "/mcp playwright headed", "/mcp playwright headless",
-    "/mcp web", "/token", "/refresh", "/help", "/exit",
+    "/mcp web", "/token", "/refresh", "/yolo", "/help", "/exit",
 ]
 
 # Model IDs — cập nhật runtime khi fetch_models
@@ -466,6 +488,261 @@ SYSTEM_PROMPT = (
 )
 
 
+# ═════════════════════════════════════════���═════════════════════
+# RICH UI HELPERS — Claude Code style display
+# ═══════════════════════════════════════════════════════════════
+
+def _format_tool_summary(tool_name: str, func_args: dict) -> str:
+    """Trả về mô tả 1 dòng dễ đọc cho tool call."""
+    if tool_name == "read_text_file":
+        path = func_args.get("path", func_args.get("file_path", "?"))
+        return f"Reading {path}"
+    elif tool_name == "write_file":
+        path = func_args.get("path", func_args.get("file_path", "?"))
+        return f"Writing {path}"
+    elif tool_name == "edit_file":
+        path = func_args.get("path", func_args.get("file_path", "?"))
+        return f"Editing {path}"
+    elif tool_name == "list_directory":
+        path = func_args.get("path", func_args.get("directory", "."))
+        return f"Listing {path}"
+    elif tool_name == "search_files":
+        pattern = func_args.get("pattern", func_args.get("query", "?"))
+        return f"Searching: {pattern}"
+    elif tool_name == "execute_command":
+        cmd = func_args.get("command", "?")
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "..."
+        return f"Running: {cmd}"
+    elif tool_name == "fetch":
+        url = func_args.get("url", "?")
+        if len(url) > 60:
+            url = url[:57] + "..."
+        return f"Fetching {url}"
+    elif tool_name == "web_search":
+        query = func_args.get("query", "?")
+        return f"Searching web: {query}"
+    else:
+        return f"Calling {tool_name}"
+
+
+def _ask_permission(tool_name: str, func_args: dict) -> bool:
+    """Hiện cảnh báo tool nguy hiểm, hỏi user cho phép. Bỏ qua nếu yolo_mode."""
+    global yolo_mode
+    if yolo_mode:
+        return True
+    if not HAS_RICH:
+        return True
+
+    summary = _format_tool_summary(tool_name, func_args)
+
+    # Show compact summary — không dump raw JSON
+    console.print(f"  [bold yellow]{summary}[/]")
+    try:
+        answer = input(f"  {C.YELLOW}Allow? (Y/n): {C.RESET}").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return False
+
+    return answer in ("", "y", "yes")
+
+
+def _generate_diff(old_content: str, new_content: str, filename: str = "file") -> str:
+    """Tạo unified diff string."""
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{filename}", tofile=f"b/{filename}")
+    return "".join(diff)
+
+
+def _render_tool_result(tool_name: str, func_args: dict, result_text: str, old_content: str = None) -> None:
+    """Hiện kết quả tool compact — Claude Code style.
+
+    Nguyên tắc: chỉ hiện summary 1 dòng. Chỉ show details khi lỗi hoặc diff.
+    """
+    if not HAS_RICH:
+        # Fallback to raw print
+        preview = result_text[:200] + "..." if len(result_text) > 200 else result_text
+        print(f"     {C.DIM}→ {preview}{C.RESET}")
+        return
+
+    is_error = "[Tool Error]" in result_text or "[Lỗi]" in result_text
+    summary = _format_tool_summary(tool_name, func_args)
+
+    # ── Error → show panel with details ──
+    if is_error:
+        lines = result_text.split("\n")
+        truncated = "\n".join(lines[:15]) if len(lines) > 15 else result_text
+        console.print(Panel(
+            Text(truncated, style="red"),
+            title=f"[bold red] Error: {summary} [/]",
+            border_style="red",
+            padding=(0, 1),
+        ))
+        return
+
+    # ── Diff display cho write/edit ──
+    if old_content is not None and tool_name in ("write_file", "edit_file"):
+        filename = func_args.get("path", func_args.get("file_path", "file"))
+        new_content = func_args.get("content", result_text)
+        diff_text = _generate_diff(old_content, new_content, os.path.basename(filename))
+        if diff_text.strip():
+            # Count additions/deletions
+            added = sum(1 for l in diff_text.splitlines() if l.startswith("+") and not l.startswith("+++"))
+            removed = sum(1 for l in diff_text.splitlines() if l.startswith("-") and not l.startswith("---"))
+            console.print(Panel(
+                Syntax(diff_text, "diff", theme="monokai", line_numbers=False),
+                title=f"[bold cyan] {filename} [/]",
+                subtitle=f"[dim]+{added} -{removed}[/]",
+                border_style="cyan",
+                padding=(0, 1),
+            ))
+        else:
+            console.print(f"  [dim green]✓ {filename} (no changes)[/]")
+        return
+
+    # ── Write file (new) → 1 line ──
+    if tool_name == "write_file" and old_content is None:
+        filepath = func_args.get("path", func_args.get("file_path", "file"))
+        console.print(f"  [bold green]✓ Created {filepath}[/]")
+        return
+
+    # ── Read file → compact summary (không dump nội dung) ──
+    if tool_name == "read_text_file":
+        filepath = func_args.get("path", func_args.get("file_path", "file"))
+        line_count = result_text.count("\n") + 1
+        char_count = len(result_text)
+        console.print(f"  [dim]⎯ Read {filepath} ({line_count} lines, {char_count:,} chars)[/]")
+        return
+
+    # ── Execute command → show exit status + compact output ──
+    if tool_name == "execute_command":
+        cmd = func_args.get("command", "")
+        lines = result_text.strip().split("\n")
+        if len(lines) <= 5:
+            # Short output → show inline
+            output_preview = "\n".join(lines)
+            console.print(Panel(
+                Text(output_preview),
+                title=f"[bold yellow] $ {cmd[:80]} [/]",
+                border_style="dim",
+                padding=(0, 1),
+            ))
+        else:
+            # Long output → show first/last few lines
+            console.print(f"  [dim]⎯ $ {cmd[:80]}  ({len(lines)} lines)[/]")
+        return
+
+    # ── Web search → show compact results ──
+    if tool_name == "web_search":
+        query = func_args.get("query", "?")
+        # Try parse JSON results
+        try:
+            results = json.loads(result_text)
+            if isinstance(results, list):
+                table = Table(show_header=False, box=None, padding=(0, 1))
+                table.add_column("", style="bold")
+                table.add_column("", style="dim")
+                for r in results[:5]:
+                    title = r.get("title", "")
+                    url = r.get("url", r.get("href", ""))
+                    table.add_row(title, url)
+                console.print(Panel(
+                    table,
+                    title=f"[bold blue] Search: {query} [/]",
+                    border_style="blue",
+                    padding=(0, 1),
+                ))
+                return
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Fallback: show truncated text
+        console.print(f"  [dim]⎯ Search: {query} ({len(result_text):,} chars)[/]")
+        return
+
+    # ── Fetch URL → compact ──
+    if tool_name == "fetch":
+        url = func_args.get("url", "?")
+        char_count = len(result_text)
+        console.print(f"  [dim]⎯ Fetched {url[:60]} ({char_count:,} chars)[/]")
+        return
+
+    # ── Default: 1-line summary ──
+    char_count = len(result_text)
+    console.print(f"  [dim]⎯ {summary} ({char_count:,} chars)[/]")
+
+
+class StreamingMarkdown:
+    """Rich streaming markdown renderer with thinking spinner — Claude Code style."""
+
+    def __init__(self):
+        self._buffer = ""
+        self._live = None
+        self._started = False
+        self._thinking = False
+        self._first_token = False
+
+    def start(self):
+        """Bắt đầu Live với spinner 'Thinking...'"""
+        if not HAS_RICH:
+            return
+        self._live = Live(
+            Spinner("dots", text="[dim]Thinking...[/]"),
+            console=console,
+            refresh_per_second=10,
+            transient=False,
+        )
+        self._live.start()
+        self._started = True
+        self._thinking = True
+
+    def show_thinking(self):
+        """Hiển thị spinner thinking."""
+        if not HAS_RICH or not self._live:
+            print(f"\n{C.DIM}💭 Thinking...{C.RESET}")
+            return
+        if self._started and not self._thinking:
+            self._thinking = True
+            self._live.update(Spinner("dots", text="[dim italic]Thinking...[/]"))
+
+    def feed(self, text: str):
+        """Thêm text vào buffer, re-render Markdown."""
+        if not HAS_RICH or not self._live:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            return
+
+        if self._thinking:
+            self._thinking = False
+            self._first_token = True
+
+        self._buffer += text
+        try:
+            self._live.update(Markdown(self._buffer))
+        except Exception:
+            # Fallback nếu Markdown render lỗi
+            self._live.update(Text(self._buffer))
+
+    def stop(self) -> str:
+        """Dừng Live, trả về full text."""
+        if not HAS_RICH or not self._live:
+            print()
+            return self._buffer
+
+        try:
+            # Final render
+            if self._buffer:
+                self._live.update(Markdown(self._buffer))
+            self._live.stop()
+        except Exception:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+        self._started = False
+        return self._buffer
+
+
 # ═══════════════════════════════════════════════════════════════
 # SESSION MANAGER — Lưu / Load / Quản lý phiên chat
 # ═══════════════════════════════════════════════════════════════
@@ -520,7 +797,7 @@ class SessionManager:
 
     def save(self, client, name: str = None) -> str:
         """Lưu phiên chat hiện tại.
-        
+
         Returns: đường dẫn file đã lưu, hoặc None nếu lỗi.
         """
         if not client.messages:
@@ -581,7 +858,7 @@ class SessionManager:
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(session_data, f, ensure_ascii=False, indent=2)
-            
+
             # Đánh dấu file đang dùng (cho lần save tiếp theo ghi đè)
             client._loaded_session_file = filepath
             client._session_created_at = session_data["created_at"]
@@ -598,7 +875,7 @@ class SessionManager:
 
     def load(self, client, identifier: str = None) -> bool:
         """Load phiên chat từ file.
-        
+
         identifier: số thứ tự (1-based) hoặc tên phiên (fuzzy match).
         Nếu None → hiện danh sách để chọn.
         """
@@ -1018,11 +1295,65 @@ class CopilotClient:
             categories.setdefault(cat, []).append(m)
 
         cat_labels = {
-            "lightweight": "⚡ Lightweight (Nhanh)",
-            "versatile":   "🔄 Versatile (Đa năng)",
-            "powerful":    "🚀 Powerful (Mạnh mẽ)",
-            "other":       "📦 Other",
+            "lightweight": "Lightweight (Nhanh)",
+            "versatile":   "Versatile (Da nang)",
+            "powerful":    "Powerful (Manh me)",
+            "other":       "Other",
         }
+
+        if HAS_RICH:
+            table = Table(show_header=True, header_style="bold cyan", border_style="cyan", padding=(0, 1))
+            table.add_column("#", style="dim", width=4, justify="right")
+            table.add_column("Model ID", style="bold white", min_width=30)
+            table.add_column("Vendor", style="dim", width=12)
+            table.add_column("Context", justify="right", width=8)
+            table.add_column("Output", justify="right", width=8)
+            table.add_column("Tags", width=25)
+
+            idx = 1
+            for cat in ["lightweight", "versatile", "powerful", "other"]:
+                if cat not in categories:
+                    continue
+                table.add_row("", f"[bold yellow]{cat_labels.get(cat, cat)}[/]", "", "", "", "", end_section=True)
+
+                for m in categories[cat]:
+                    model_id = m.get("id", "")
+                    vendor = m.get("vendor", "")
+                    is_premium = m.get("billing", {}).get("is_premium", False)
+                    multiplier = m.get("billing", {}).get("multiplier", 0)
+                    is_preview = m.get("preview", False)
+                    is_default = m.get("is_chat_default", False)
+                    supports_thinking = m.get("capabilities", {}).get("supports", {}).get("adaptive_thinking", False) or \
+                                        m.get("capabilities", {}).get("supports", {}).get("max_thinking_budget", 0) > 0
+                    max_ctx = m.get("capabilities", {}).get("limits", {}).get("max_context_window_tokens", 0)
+                    max_out = m.get("capabilities", {}).get("limits", {}).get("max_output_tokens", 0)
+
+                    tags = []
+                    if is_default:
+                        tags.append("[green]DEFAULT[/]")
+                    if is_preview:
+                        tags.append("[magenta]PREVIEW[/]")
+                    if is_premium:
+                        tags.append(f"[yellow]PREMIUM x{multiplier}[/]")
+                    else:
+                        tags.append("[green]FREE[/]")
+                    if supports_thinking:
+                        tags.append("[cyan]THINK[/]")
+
+                    ctx_k = f"{max_ctx // 1000}K" if max_ctx else "?"
+                    out_k = f"{max_out // 1000}K" if max_out else "?"
+
+                    marker = "[green]>[/] " if self.selected_model and self.selected_model == model_id else "  "
+                    model_display = f"{marker}{model_id}"
+
+                    table.add_row(str(idx), model_display, vendor, ctx_k, out_k, " ".join(tags))
+                    idx += 1
+
+            console.print()
+            console.print(Panel(table, title="[bold cyan] DANH SACH MODELS [/]", border_style="cyan"))
+            console.print("  [dim]Dung /select <so> hoac /select <model_id> de chon model.[/]")
+            console.print()
+            return
 
         print()
         print(f"{C.BOLD}{C.CYAN}{'═' * 80}{C.RESET}")
@@ -1148,24 +1479,47 @@ class CopilotClient:
         supports = caps.get("supports", {})
         billing = found.get("billing", {})
 
-        print()
-        print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
-        print(f"  {C.BOLD}Model: {C.WHITE}{found.get('name', '')}{C.RESET}")
-        print(f"  {C.DIM}ID: {found.get('id', '')}{C.RESET}")
-        print(f"{C.CYAN}{'─' * 60}{C.RESET}")
-        print(f"  Vendor:          {found.get('vendor', '')}")
-        print(f"  Version:         {found.get('version', '')}")
-        print(f"  Preview:         {found.get('preview', False)}")
-        print(f"  Premium:         {billing.get('is_premium', False)} (x{billing.get('multiplier', 0)})")
-        print(f"  Context Window:  {limits.get('max_context_window_tokens', '?'):,} tokens")
-        print(f"  Max Output:      {limits.get('max_output_tokens', '?'):,} tokens")
-        print(f"  Max Prompt:      {limits.get('max_prompt_tokens', '?'):,} tokens")
-        print(f"  Vision:          {supports.get('vision', False)}")
-        print(f"  Tool Calls:      {supports.get('tool_calls', False)}")
-        print(f"  Streaming:       {supports.get('streaming', False)}")
-        print(f"  Thinking:        {supports.get('max_thinking_budget', 0) > 0}")
-        print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
-        print()
+        if HAS_RICH:
+            info_table = Table(show_header=False, border_style="cyan", padding=(0, 2), box=None)
+            info_table.add_column("Property", style="bold", width=18)
+            info_table.add_column("Value")
+            info_table.add_row("ID", found.get("id", ""))
+            info_table.add_row("Vendor", found.get("vendor", ""))
+            info_table.add_row("Version", found.get("version", ""))
+            info_table.add_row("Preview", str(found.get("preview", False)))
+            info_table.add_row("Premium", f"{billing.get('is_premium', False)} (x{billing.get('multiplier', 0)})")
+            ctx_tokens = limits.get("max_context_window_tokens", "?")
+            out_tokens = limits.get("max_output_tokens", "?")
+            prompt_tokens = limits.get("max_prompt_tokens", "?")
+            info_table.add_row("Context Window", f"{ctx_tokens:,} tokens" if isinstance(ctx_tokens, int) else str(ctx_tokens))
+            info_table.add_row("Max Output", f"{out_tokens:,} tokens" if isinstance(out_tokens, int) else str(out_tokens))
+            info_table.add_row("Max Prompt", f"{prompt_tokens:,} tokens" if isinstance(prompt_tokens, int) else str(prompt_tokens))
+            info_table.add_row("Vision", str(supports.get("vision", False)))
+            info_table.add_row("Tool Calls", str(supports.get("tool_calls", False)))
+            info_table.add_row("Streaming", str(supports.get("streaming", False)))
+            info_table.add_row("Thinking", str(supports.get("max_thinking_budget", 0) > 0))
+            console.print()
+            console.print(Panel(info_table, title=f"[bold cyan] {found.get('name', '')} [/]", border_style="cyan"))
+            console.print()
+        else:
+            print()
+            print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
+            print(f"  {C.BOLD}Model: {C.WHITE}{found.get('name', '')}{C.RESET}")
+            print(f"  {C.DIM}ID: {found.get('id', '')}{C.RESET}")
+            print(f"{C.CYAN}{'─' * 60}{C.RESET}")
+            print(f"  Vendor:          {found.get('vendor', '')}")
+            print(f"  Version:         {found.get('version', '')}")
+            print(f"  Preview:         {found.get('preview', False)}")
+            print(f"  Premium:         {billing.get('is_premium', False)} (x{billing.get('multiplier', 0)})")
+            print(f"  Context Window:  {limits.get('max_context_window_tokens', '?'):,} tokens")
+            print(f"  Max Output:      {limits.get('max_output_tokens', '?'):,} tokens")
+            print(f"  Max Prompt:      {limits.get('max_prompt_tokens', '?'):,} tokens")
+            print(f"  Vision:          {supports.get('vision', False)}")
+            print(f"  Tool Calls:      {supports.get('tool_calls', False)}")
+            print(f"  Streaming:       {supports.get('streaming', False)}")
+            print(f"  Thinking:        {supports.get('max_thinking_budget', 0) > 0}")
+            print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
+            print()
 
     # ─── Chat ────────────────────────────────────────────────
     def chat(self, user_message: str) -> str:
@@ -1254,28 +1608,47 @@ class CopilotClient:
                 except json.JSONDecodeError:
                     func_args = {}
 
-                print(f"\n  {C.YELLOW}🔧 Gọi tool: {C.BOLD}{func_name}{C.RESET}")
-                # Debug: luôn hiển thị raw args string
-                print(f"     {C.DIM}[args_raw] {repr(func_args_str[:300])}{C.RESET}")
-                if func_args:
-                    # Hiển thị args ngắn gọn
-                    args_display = json.dumps(func_args, ensure_ascii=False)
-                    if len(args_display) > 200:
-                        args_display = args_display[:197] + "..."
-                    print(f"     {C.DIM}{args_display}{C.RESET}")
-                else:
-                    # Debug: show raw args string if parsing failed or empty
-                    print(f"     {C.RED}[DEBUG] raw args: {repr(func_args_str[:200])}{C.RESET}")
+                summary = _format_tool_summary(func_name, func_args)
 
-                # Gọi MCP tool
-                if self.mcp_manager:
-                    tool_result = self.mcp_manager.execute_tool(func_name, func_args)
-                else:
-                    tool_result = "[Lỗi] MCP Manager chưa được khởi tạo"
+                # Permission check cho dangerous tools
+                if func_name in DANGEROUS_TOOLS:
+                    if not _ask_permission(func_name, func_args):
+                        tool_result = "[Permission denied by user]"
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": tool_result,
+                        })
+                        continue
 
-                # Hiển thị kết quả ngắn gọn
-                result_preview = tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
-                print(f"     {C.DIM}→ {result_preview}{C.RESET}")
+                # Đọc file hiện tại trước nếu write/edit (để tạo diff sau)
+                old_content = None
+                if func_name in ("write_file", "edit_file") and self.mcp_manager:
+                    filepath = func_args.get("path", func_args.get("file_path", ""))
+                    if filepath:
+                        try:
+                            old_content = self.mcp_manager.execute_tool("read_text_file", {"path": filepath})
+                            if "[Tool Error]" in old_content or "[Lỗi]" in old_content:
+                                old_content = None  # File chưa tồn tại
+                        except Exception:
+                            old_content = None
+
+                # Gọi MCP tool với spinner
+                if HAS_RICH:
+                    with console.status(f"[bold cyan]{summary}[/]", spinner="dots"):
+                        if self.mcp_manager:
+                            tool_result = self.mcp_manager.execute_tool(func_name, func_args)
+                        else:
+                            tool_result = "[Lỗi] MCP Manager chưa được khởi tạo"
+                else:
+                    print(f"\n  {C.YELLOW}🔧 {summary}{C.RESET}")
+                    if self.mcp_manager:
+                        tool_result = self.mcp_manager.execute_tool(func_name, func_args)
+                    else:
+                        tool_result = "[Lỗi] MCP Manager chưa được khởi tạo"
+
+                # Hiển thị kết quả
+                _render_tool_result(func_name, func_args, tool_result, old_content=old_content)
 
                 # Track errors
                 if "[Tool Error]" in tool_result or "[Lỗi]" in tool_result:
@@ -1311,7 +1684,10 @@ class CopilotClient:
                 consecutive_errors = 0
 
             # Tiếp tục vòng lặp để AI xử lý kết quả tool
-            print(f"\n{C.BLUE}🤖 Copilot:{C.RESET}")
+            if HAS_RICH:
+                console.print(Rule(style="dim"))
+            else:
+                print(f"\n{C.BLUE}🤖 Copilot:{C.RESET}")
 
         return full_content or ""
 
@@ -1324,7 +1700,7 @@ class CopilotClient:
     @staticmethod
     def _split_concat_json(s: str) -> list:
         """Split concatenated JSON objects: '{"a":1}{"b":2}' → ['{"a":1}', '{"b":2}']
-        
+
         Handles Gemini's quirk of merging parallel tool calls into one string.
         Uses a simple brace-depth counter (ignores strings for speed).
         """
@@ -1360,7 +1736,7 @@ class CopilotClient:
 
     def _trim_messages_for_context(self, messages: list, max_tokens: int = 100000) -> list:
         """Cắt bớt messages cũ nếu tổng tokens vượt ngưỡng.
-        
+
         Giữ lại: message đầu (user prompt gốc) + N messages cuối (context gần nhất).
         Truncate tool results dài trong messages cũ.
         """
@@ -1527,6 +1903,8 @@ class CopilotClient:
             showed_reasoning_header = False
             buffer = ""
             tool_calls_acc = {}  # index -> {id, function: {name, arguments}}
+            md = StreamingMarkdown()
+            md.start()
 
             for chunk_bytes in resp.iter_content(chunk_size=None):
                 if not chunk_bytes:
@@ -1566,7 +1944,7 @@ class CopilotClient:
                     r_text = delta.get("reasoning_text")
                     if r_text:
                         if not showed_reasoning_header:
-                            print(f"\n{C.DIM}💭 Thinking...{C.RESET}")
+                            md.show_thinking()
                             showed_reasoning_header = True
                         reasoning_text += r_text
 
@@ -1625,8 +2003,7 @@ class CopilotClient:
                     content = delta.get("content")
                     if content:
                         full_content += content
-                        sys.stdout.write(content)
-                        sys.stdout.flush()
+                        md.feed(content)
 
                     # Finish reason
                     finish = choices[0].get("finish_reason")
@@ -1634,7 +2011,7 @@ class CopilotClient:
                         buffer = ""
                         break
 
-            print()  # Newline sau khi stream xong
+            md.stop()  # Dừng streaming markdown
 
             # Build tool_calls list với validation
             tool_calls = []
@@ -1653,49 +2030,54 @@ class CopilotClient:
                         json.loads(args_str)
                         tool_calls.append(tc)
                     except (json.JSONDecodeError, TypeError):
-                        # Detect concatenated JSON objects: {"cmd":"a"}{"url":"b"}{"cmd":"c"}
-                        # Gemini sometimes merges parallel tool calls into one args string
-                        split_objects = self._split_concat_json(args_str)
-                        if len(split_objects) > 1:
-                            print(f"     {C.YELLOW}[!] Tách {len(split_objects)} tool calls bị merge{C.RESET}")
-                            for i, obj_str in enumerate(split_objects):
-                                try:
-                                    obj = json.loads(obj_str)
-                                    # Infer tool name từ keys
-                                    inferred_name = tc_name
-                                    if "url" in obj:
-                                        inferred_name = "fetch"
-                                    elif "command" in obj:
-                                        inferred_name = "execute_command"
-                                    elif "path" in obj and "content" in obj:
-                                        inferred_name = "write_file"
-                                    elif "path" in obj:
-                                        inferred_name = "read_text_file"
-
-                                    split_tc = {
-                                        "id": tc["id"] + f"_split{i}" if i > 0 else tc["id"],
-                                        "type": "function",
-                                        "function": {
-                                            "name": inferred_name,
-                                            "arguments": obj_str,
-                                        },
-                                    }
-                                    tool_calls.append(split_tc)
-                                except json.JSONDecodeError:
-                                    pass  # Skip invalid fragments
+                        # Arguments rỗng → fallback "{}"
+                        # Nhiều MCP tools (browser_install, etc.) không cần args
+                        if not args_str or not args_str.strip() or len(args_str.strip()) <= 2:
+                            tc["function"]["arguments"] = "{}"
+                            tool_calls.append(tc)
                         else:
-                            print(f"     {C.RED}[!] Tool '{tc_name}' invalid JSON args ({len(args_str)} chars): {repr(args_str[:300])}{C.RESET}")
-                            # Nếu args rỗng hoặc quá ngắn → Opus "ghost" tool call → bỏ qua
-                            # Chỉ fallback "{}" nếu args thực sự có nội dung nhưng JSON bị lỗi
-                            if len(args_str.strip()) > 2:
+                            # Detect concatenated JSON objects: {"cmd":"a"}{"url":"b"}
+                            split_objects = self._split_concat_json(args_str)
+                            if len(split_objects) > 1:
+                                print(f"     {C.YELLOW}[!] Tách {len(split_objects)} tool calls bị merge{C.RESET}")
+                                for i, obj_str in enumerate(split_objects):
+                                    try:
+                                        obj = json.loads(obj_str)
+                                        # Infer tool name từ keys
+                                        inferred_name = tc_name
+                                        if "url" in obj:
+                                            inferred_name = "fetch"
+                                        elif "command" in obj:
+                                            inferred_name = "execute_command"
+                                        elif "path" in obj and "content" in obj:
+                                            inferred_name = "write_file"
+                                        elif "path" in obj:
+                                            inferred_name = "read_text_file"
+
+                                        split_tc = {
+                                            "id": tc["id"] + f"_split{i}" if i > 0 else tc["id"],
+                                            "type": "function",
+                                            "function": {
+                                                "name": inferred_name,
+                                                "arguments": obj_str,
+                                            },
+                                        }
+                                        tool_calls.append(split_tc)
+                                    except json.JSONDecodeError:
+                                        pass  # Skip invalid fragments
+                            else:
+                                print(f"     {C.RED}[!] Tool '{tc_name}' invalid JSON args ({len(args_str)} chars): {repr(args_str[:300])}{C.RESET}")
+                                # Fallback "{}" nếu args có nội dung nhưng JSON bị lỗi
                                 tc["function"]["arguments"] = "{}"
                                 tool_calls.append(tc)
-                            else:
-                                print(f"     {C.RED}[!] Bỏ qua tool call rỗng (Opus ghost call){C.RESET}")
 
             return (full_content, tool_calls)
 
         except requests.exceptions.RequestException as e:
+            try:
+                md.stop()
+            except Exception:
+                pass
             print(f"{C.RED}[!] Lỗi kết nối: {e}{C.RESET}")
             # Chỉ pop nếu message cuối là user message (round đầu tiên)
             # Nếu đang giữa tool loop, không pop để retry giữ nguyên context
@@ -1708,13 +2090,13 @@ class CopilotClient:
     # ─── Responses API (oswe-vscode-prime / Raptor Mini) ─────
     def _build_responses_input(self, effective_system: str) -> list:
         """Chuyển đổi self.messages (Chat format) sang Responses API input format.
-        
+
         Chat Completions format:
             {"role": "system", "content": "..."}
             {"role": "user", "content": "..."}
             {"role": "assistant", "content": "...", "tool_calls": [...]}
             {"role": "tool", "tool_call_id": "...", "content": "..."}
-        
+
         Responses API format:
             {"role": "system", "content": [{"type": "input_text", "text": "..."}]}
             {"role": "user", "content": [{"type": "input_text", "text": "..."}]}
@@ -1865,6 +2247,8 @@ class CopilotClient:
             showed_reasoning_header = False
             buffer = ""
             tool_calls = []  # list of {id, type, function: {name, arguments}}
+            md = StreamingMarkdown()
+            md.start()
 
             # Accumulator cho function_call streaming
             # Responses API gửi function_call dưới dạng output_item
@@ -1907,13 +2291,12 @@ class CopilotClient:
                         delta_text = event_data.get("delta", "")
                         if delta_text:
                             full_content += delta_text
-                            sys.stdout.write(delta_text)
-                            sys.stdout.flush()
+                            md.feed(delta_text)
 
                     # ─── Reasoning (thinking) ───
                     elif event_type == "response.reasoning.delta":
                         if not showed_reasoning_header:
-                            print(f"\n{C.DIM}💭 Thinking...{C.RESET}")
+                            md.show_thinking()
                             showed_reasoning_header = True
 
                     # ─── Output item added (new message, function_call, reasoning) ───
@@ -1932,7 +2315,7 @@ class CopilotClient:
 
                         elif item_type == "reasoning":
                             if not showed_reasoning_header:
-                                print(f"\n{C.DIM}💭 Thinking...{C.RESET}")
+                                md.show_thinking()
                                 showed_reasoning_header = True
 
                     # ─── Function call argument delta ───
@@ -2003,11 +2386,10 @@ class CopilotClient:
                                             text = part.get("text", "")
                                             if text:
                                                 full_content = text
-                                                sys.stdout.write(text)
-                                                sys.stdout.flush()
+                                                md.feed(text)
                         break
 
-            print()  # Newline sau khi stream xong
+            md.stop()  # Dừng streaming markdown
 
             # Validate tool calls
             validated_tool_calls = []
@@ -2017,31 +2399,40 @@ class CopilotClient:
                     json.loads(args_str)
                     validated_tool_calls.append(tc)
                 except (json.JSONDecodeError, TypeError):
-                    # Try split concatenated JSON
-                    split_objects = self._split_concat_json(args_str)
-                    if len(split_objects) > 1:
-                        print(f"     {C.YELLOW}[!] Tách {len(split_objects)} tool calls bị merge{C.RESET}")
-                        for i, obj_str in enumerate(split_objects):
-                            try:
-                                json.loads(obj_str)
-                                validated_tool_calls.append({
-                                    "id": tc["id"] + f"_split{i}" if i > 0 else tc["id"],
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc["function"]["name"],
-                                        "arguments": obj_str,
-                                    },
-                                })
-                            except json.JSONDecodeError:
-                                pass
-                    else:
-                        print(f"     {C.RED}[!] Tool '{tc['function']['name']}' invalid JSON args: {repr(args_str[:300])}{C.RESET}")
+                    # Arguments rỗng → fallback "{}"
+                    if not args_str or not args_str.strip() or len(args_str.strip()) <= 2:
                         tc["function"]["arguments"] = "{}"
                         validated_tool_calls.append(tc)
+                    else:
+                        # Try split concatenated JSON
+                        split_objects = self._split_concat_json(args_str)
+                        if len(split_objects) > 1:
+                            print(f"     {C.YELLOW}[!] Tách {len(split_objects)} tool calls bị merge{C.RESET}")
+                            for i, obj_str in enumerate(split_objects):
+                                try:
+                                    json.loads(obj_str)
+                                    validated_tool_calls.append({
+                                        "id": tc["id"] + f"_split{i}" if i > 0 else tc["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc["function"]["name"],
+                                            "arguments": obj_str,
+                                        },
+                                    })
+                                except json.JSONDecodeError:
+                                    pass
+                        else:
+                            print(f"     {C.RED}[!] Tool '{tc['function']['name']}' invalid JSON args: {repr(args_str[:300])}{C.RESET}")
+                            tc["function"]["arguments"] = "{}"
+                            validated_tool_calls.append(tc)
 
             return (full_content, validated_tool_calls)
 
         except requests.exceptions.RequestException as e:
+            try:
+                md.stop()
+            except Exception:
+                pass
             print(f"{C.RED}[!] Lỗi kết nối: {e}{C.RESET}")
             if self.messages and self.messages[-1].get("role") == "user" and not any(
                 m.get("role") == "tool" for m in self.messages[-3:]
@@ -2066,16 +2457,26 @@ class CopilotClient:
 
     def display_system_prompt(self):
         """Hiển thị system prompt hiện tại."""
-        print()
-        print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
-        print(f"  {C.BOLD}🔧 SYSTEM PROMPT HIỆN TẠI{C.RESET}")
-        print(f"{C.CYAN}{'─' * 60}{C.RESET}")
-        for line in self.system_prompt.split("\n"):
-            print(f"  {C.DIM}{line}{C.RESET}")
-        print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
-        print(f"  {C.DIM}Dùng /system set <nội dung> để thay đổi{C.RESET}")
-        print(f"  {C.DIM}Dùng /system reset để reset về mặc định{C.RESET}")
-        print()
+        if HAS_RICH:
+            console.print()
+            console.print(Panel(
+                Markdown(self.system_prompt),
+                title="[bold cyan] SYSTEM PROMPT [/]",
+                border_style="cyan",
+                padding=(1, 2),
+            ))
+            console.print("  [dim]Dung /system set <noi dung> de thay doi[/]")
+            console.print("  [dim]Dung /system reset de reset ve mac dinh[/]")
+            console.print()
+        else:
+            print()
+            print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
+            print(f"  {C.BOLD}SYSTEM PROMPT HIEN TAI{C.RESET}")
+            print(f"{C.CYAN}{'─' * 60}{C.RESET}")
+            for line in self.system_prompt.split("\n"):
+                print(f"  {C.DIM}{line}{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
+            print()
 
     def display_history(self):
         """Hiển thị lịch sử hội thoại."""
@@ -2083,92 +2484,157 @@ class CopilotClient:
             print(f"{C.YELLOW}[!] Chưa có lịch sử hội thoại.{C.RESET}")
             return
 
-        print()
-        print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
-        print(f"  {C.BOLD}📜 LỊCH SỬ HỘI THOẠI ({len(self.messages)} messages){C.RESET}")
-        print(f"{C.CYAN}{'═' * 60}{C.RESET}")
+        if HAS_RICH:
+            console.print()
+            console.print(Rule(f"[bold cyan]LICH SU HOI THOAI ({len(self.messages)} messages)[/]"))
+            for i, msg in enumerate(self.messages):
+                role = msg["role"]
+                content = msg.get("content") or ""
 
-        for i, msg in enumerate(self.messages):
-            role = msg["role"]
-            content = msg.get("content") or ""
+                if role == "user":
+                    if len(content) > 300:
+                        content = content[:300] + "..."
+                    console.print(Panel(content, title="[green] You [/]", border_style="green", padding=(0, 1)))
+                elif role == "tool":
+                    if len(content) > 300:
+                        content = content[:300] + "..."
+                    console.print(Panel(
+                        Text(content, style="dim"),
+                        title=f"[yellow] Tool [/]",
+                        border_style="yellow",
+                        padding=(0, 1),
+                    ))
+                else:
+                    tool_calls_list = msg.get("tool_calls")
+                    if tool_calls_list and not content:
+                        names = [tc.get("function", {}).get("name", "?") for tc in tool_calls_list]
+                        console.print(f"  [blue]Copilot -> goi tool: {', '.join(names)}[/]")
+                        continue
+                    if len(content) > 300:
+                        content = content[:300] + "..."
+                    console.print(Panel(
+                        Markdown(content),
+                        title="[blue] Copilot [/]",
+                        border_style="blue",
+                        padding=(0, 1),
+                    ))
+            console.print(Rule(style="cyan"))
+            console.print()
+        else:
+            print()
+            print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
+            print(f"  {C.BOLD}LICH SU HOI THOAI ({len(self.messages)} messages){C.RESET}")
+            print(f"{C.CYAN}{'═' * 60}{C.RESET}")
 
-            if role == "user":
-                print(f"\n  {C.GREEN}👤 You:{C.RESET}")
-            elif role == "tool":
-                tool_name = msg.get("name", "tool")
-                print(f"\n  {C.MAGENTA}🔧 Tool ({tool_name}):{C.RESET}")
-            else:
-                # assistant — có thể có tool_calls
-                tool_calls = msg.get("tool_calls")
-                if tool_calls and not content:
-                    names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
-                    print(f"\n  {C.BLUE}🤖 Copilot → gọi tool: {', '.join(names)}{C.RESET}")
-                    continue
-                print(f"\n  {C.BLUE}🤖 Copilot:{C.RESET}")
+            for i, msg in enumerate(self.messages):
+                role = msg["role"]
+                content = msg.get("content") or ""
 
-            # Truncate nếu quá dài
-            if len(content) > 300:
-                content = content[:300] + "..."
-            for line in content.split("\n"):
-                print(f"    {line}")
+                if role == "user":
+                    print(f"\n  {C.GREEN}You:{C.RESET}")
+                elif role == "tool":
+                    print(f"\n  {C.MAGENTA}Tool:{C.RESET}")
+                else:
+                    tool_calls_list = msg.get("tool_calls")
+                    if tool_calls_list and not content:
+                        names = [tc.get("function", {}).get("name", "?") for tc in tool_calls_list]
+                        print(f"\n  {C.BLUE}Copilot -> goi tool: {', '.join(names)}{C.RESET}")
+                        continue
+                    print(f"\n  {C.BLUE}Copilot:{C.RESET}")
 
-        print(f"\n{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
-        print()
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                for line in content.split("\n"):
+                    print(f"    {line}")
+
+            print(f"\n{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
+            print()
 
 
 # ═══════════════════════════════════════════════════════════════
 # HELP
 # ═══════════════════════════════════════════════════════════════
 def display_help():
-    print(f"""
+    if not HAS_RICH:
+        print(f"""
 {C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}
-  {C.BOLD}📖 HƯỚNG DẪN SỬ DỤNG{C.RESET}
+  {C.BOLD}HUONG DAN SU DUNG{C.RESET}
 {C.CYAN}{'═' * 60}{C.RESET}
-
-  {C.YELLOW}/models{C.RESET}          Xem danh sách models có sẵn
-  {C.YELLOW}/select <số|id>{C.RESET}  Chọn model (VD: /select 1 hoặc /select gpt-4o)
-  {C.YELLOW}/info{C.RESET}            Xem thông tin model đang dùng
-  {C.YELLOW}/system{C.RESET}          Xem system prompt hiện tại
-  {C.YELLOW}/system set{C.RESET}      Thay đổi system prompt (nhập multi-line)
-  {C.YELLOW}/system reset{C.RESET}    Reset system prompt về mặc định
-  {C.YELLOW}/clear{C.RESET}           Xóa lịch sử hội thoại
-  {C.YELLOW}/history{C.RESET}         Xem lịch sử hội thoại
-
-  {C.BOLD}💾 Quản lý phiên:{C.RESET}
-  {C.YELLOW}/save [tên]{C.RESET}      Lưu phiên chat (tên tự động nếu bỏ trống)
-  {C.YELLOW}/load [số|tên]{C.RESET}   Load phiên chat đã lưu
-  {C.YELLOW}/sessions{C.RESET}        Xem danh sách phiên đã lưu
-  {C.YELLOW}/sessions rename <số> <tên>{C.RESET}  Đổi tên phiên
-  {C.YELLOW}/sessions delete <số>{C.RESET}        Xóa phiên
-
-  {C.BOLD}🔌 MCP Servers:{C.RESET}
-  {C.YELLOW}/mcp{C.RESET}             Xem danh sách MCP tools đang kết nối
-  {C.YELLOW}/mcp add <dir>{C.RESET}   Thêm thư mục vào MCP Filesystem Server
-  {C.YELLOW}/mcp fetch{C.RESET}       Thêm MCP Fetch Server (tải web)
-  {C.YELLOW}/mcp shell{C.RESET}       Thêm MCP Shell Server (chạy lệnh terminal)
-  {C.YELLOW}/mcp search{C.RESET}      Thêm Web Search (DuckDuckGo, không cần API)
-  {C.YELLOW}/mcp playwright{C.RESET}  Thêm Playwright Server (headless, mặc định)
-  {C.YELLOW}/mcp playwright headed{C.RESET}  Playwright có giao diện (hiện trình duyệt)
-  {C.YELLOW}/mcp web{C.RESET}         Thêm tất cả Web servers (search+fetch+playwright)
-  {C.YELLOW}/mcp auto{C.RESET}        Tự động thêm tất cả MCP servers
-  {C.YELLOW}/mcp stop{C.RESET}        Dừng tất cả MCP servers
-
-  {C.YELLOW}/token{C.RESET}           Đổi GitHub token
-  {C.YELLOW}/refresh{C.RESET}         Refresh Copilot token
-  {C.YELLOW}/help{C.RESET}            Xem hướng dẫn này
-  {C.YELLOW}/exit{C.RESET}            Thoát chương trình
-
-  {C.DIM}Nhập bất kỳ nội dung nào khác để chat với AI.{C.RESET}
-
+  /models, /select, /info, /system, /clear, /history
+  /save, /load, /sessions, /mcp, /token, /refresh, /help, /exit
 {C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}
 """)
+        return
+
+    table = Table(show_header=True, header_style="bold cyan", border_style="cyan", padding=(0, 2))
+    table.add_column("Command", style="yellow bold", min_width=28)
+    table.add_column("Description", style="white")
+
+    # Chat & Model
+    table.add_row("[bold white]Chat & Model[/]", "", end_section=True)
+    table.add_row("/models", "Xem danh sach models co san")
+    table.add_row("/select <so|id>", "Chon model (VD: /select 1)")
+    table.add_row("/info", "Xem thong tin model dang dung")
+    table.add_row("/system", "Xem system prompt hien tai")
+    table.add_row("/system set", "Thay doi system prompt")
+    table.add_row("/system reset", "Reset system prompt ve mac dinh")
+    table.add_row("/clear", "Xoa lich su hoi thoai")
+    table.add_row("/history", "Xem lich su hoi thoai", end_section=True)
+
+    # Session
+    table.add_row("[bold white]Session Management[/]", "", end_section=True)
+    table.add_row("/save [ten]", "Luu phien chat")
+    table.add_row("/load [so|ten]", "Load phien chat da luu")
+    table.add_row("/sessions", "Xem danh sach phien da luu")
+    table.add_row("/sessions rename <so> <ten>", "Doi ten phien")
+    table.add_row("/sessions delete <so>", "Xoa phien", end_section=True)
+
+    # MCP
+    table.add_row("[bold white]MCP Servers[/]", "", end_section=True)
+    table.add_row("/mcp", "Xem danh sach MCP tools")
+    table.add_row("/mcp add <dir>", "Them thu muc Filesystem")
+    table.add_row("/mcp fetch", "Them Fetch Server")
+    table.add_row("/mcp shell", "Them Shell Server")
+    table.add_row("/mcp search", "Them Web Search (DuckDuckGo)")
+    table.add_row("/mcp playwright", "Them Playwright (headless)")
+    table.add_row("/mcp web", "Tat ca Web servers")
+    table.add_row("/mcp auto", "Tat ca MCP servers")
+    table.add_row("/mcp stop", "Dung tat ca MCP servers", end_section=True)
+
+    # Other
+    table.add_row("[bold white]Other[/]", "", end_section=True)
+    table.add_row("/yolo", "Toggle YOLO mode (auto-approve tool calls)")
+    table.add_row("/token", "Doi GitHub token")
+    table.add_row("/refresh", "Refresh Copilot token")
+    table.add_row("/help", "Xem huong dan nay")
+    table.add_row("/exit", "Thoat chuong trinh")
+
+    console.print()
+    console.print(Panel(table, title="[bold cyan] HUONG DAN SU DUNG [/]", border_style="cyan", padding=(1, 1)))
+    console.print("  [dim]Nhap bat ky noi dung nao khac de chat voi AI.[/]")
+    console.print()
 
 
 # ═══════════════════════════════════════════════════════════════
 # BANNER
 # ═══════════════════════════════════════════════════════════════
 def display_banner():
-    banner = f"""
+    ascii_art = """  ██████╗  ██████╗ ██████╗ ██╗██╗      ██████╗ ████████╗
+ ██╔════╝ ██╔═══██╗██╔══██╗██║██║     ██╔═══██╗╚══██╔══╝
+ ██║      ██║   ██║██████╔╝██║██║     ██║   ██║   ██║
+ ██║      ██║   ██║██╔═══╝ ██║██║     ██║   ██║   ██║
+ ╚██████╗ ╚██████╔╝██║     ██║███████╗╚██████╔╝   ██║
+  ╚═════╝  ╚═════╝ ╚═╝     ╚═╝╚══════╝ ╚═════╝    ╚═╝
+
+     GitHub Copilot Chat CLI Tool v1.0"""
+    if HAS_RICH:
+        console.print(Panel(
+            Text(ascii_art, style="bold cyan", justify="center"),
+            border_style="cyan",
+            padding=(1, 2),
+        ))
+    else:
+        banner = f"""
 {C.BOLD}{C.CYAN}
   ╔══════════════════════════════════════════════════════════╗
   ║                                                          ║
@@ -2183,13 +2649,14 @@ def display_banner():
   ║                                                          ║
   ╚══════════════════════════════════════════════════════════╝
 {C.RESET}"""
-    print(banner)
+        print(banner)
 
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 def main():
+    global yolo_mode
     display_banner()
 
     client = CopilotClient()
@@ -2283,9 +2750,27 @@ def main():
     # ─── Chat Loop ───
     while True:
         try:
-            # Prompt
+            # Prompt — Claude Code style with separator line
             model_label = client.selected_model or "no-model"
-            prompt_str = f"{C.BOLD}{C.GREEN}[{model_label}]{C.RESET} {C.BOLD}>{C.RESET} "
+            if HAS_RICH:
+                # Print decorative separator before input
+                try:
+                    term_w = os.get_terminal_size(0).columns
+                except (OSError, ValueError):
+                    term_w = 80
+                yolo_tag = f" {C.RED}•YOLO{C.RESET}" if yolo_mode else ""
+                line_char = "─"
+                dots = " ▪▪▪ "
+                left_len = term_w - len(dots) - 1
+                if left_len < 10:
+                    left_len = 10
+                sep_line = f"{C.DIM}{line_char * left_len}{dots}{line_char}{C.RESET}"
+                print(sep_line)
+                # Show model label + yolo tag on separate line
+                print(f"{C.DIM}{model_label}{C.RESET}{yolo_tag}")
+                prompt_str = f"{C.BOLD}❯{C.RESET} "
+            else:
+                prompt_str = f"{C.BOLD}{C.GREEN}[{model_label}]{C.RESET} {C.BOLD}>{C.RESET} "
             user_input = _smart_input(prompt_str).strip()
         except KeyboardInterrupt:
             print(f"\n{C.DIM}(Ctrl+C lần nữa để thoát){C.RESET}")
@@ -2390,6 +2875,14 @@ def main():
 
             elif cmd == "/help":
                 display_help()
+
+            elif cmd == "/yolo":
+                yolo_mode = not yolo_mode
+                status = "ON" if yolo_mode else "OFF"
+                color = C.RED if yolo_mode else C.GREEN
+                print(f"{color}[*] YOLO mode: {status}{C.RESET}")
+                if yolo_mode:
+                    print(f"{C.DIM}    Auto-approve tất cả tool calls (skip permission prompts){C.RESET}")
 
             elif cmd == "/token":
                 try:
@@ -2587,23 +3080,36 @@ def main():
 
                 else:
                     # /mcp → hiển thị tools
-                    print()
-                    print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
-                    print(f"  {C.BOLD}🔌 MCP SERVERS & TOOLS{C.RESET}")
-                    print(f"{C.CYAN}{'─' * 60}{C.RESET}")
-                    if client.mcp_manager:
-                        client.mcp_manager.display_tools()
+                    if HAS_RICH:
+                        console.print()
+                        if client.mcp_manager:
+                            # Build a table of MCP servers and their tools
+                            mcp_table = Table(show_header=True, header_style="bold cyan", border_style="cyan", padding=(0, 1))
+                            mcp_table.add_column("Server", style="bold", width=15)
+                            mcp_table.add_column("Tools", style="white")
+                            mcp_table.add_column("Status", width=8)
+                            for name, handle in client.mcp_manager.servers.items():
+                                tools = [t.get("name", "?") for t in handle.get("tools", [])]
+                                mcp_table.add_row(name, ", ".join(tools), "[green]OK[/]")
+                            if not client.mcp_manager.servers:
+                                mcp_table.add_row("[dim]none[/]", "[dim]No servers connected[/]", "[yellow]--[/]")
+                            console.print(Panel(mcp_table, title="[bold cyan] MCP SERVERS & TOOLS [/]", border_style="cyan"))
+                        else:
+                            console.print("[yellow]MCP module chua duoc cai dat.[/]")
+                        console.print("  [dim]/mcp add <dir> | /mcp fetch | /mcp shell | /mcp search | /mcp auto[/]")
+                        console.print()
                     else:
-                        print(f"  {C.YELLOW}MCP module chưa được cài đặt.{C.RESET}")
-                    print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
-                    print(f"  {C.DIM}/mcp add <dir>  - Filesystem Server{C.RESET}")
-                    print(f"  {C.DIM}/mcp fetch      - Fetch Server (tải web){C.RESET}")
-                    print(f"  {C.DIM}/mcp shell      - Shell Server (terminal){C.RESET}")
-                    print(f"  {C.DIM}/mcp search     - Web Search (DuckDuckGo){C.RESET}")
-                    print(f"  {C.DIM}/mcp playwright  - Playwright (trình duyệt){C.RESET}")
-                    print(f"  {C.DIM}/mcp web        - Tất cả web servers{C.RESET}")
-                    print(f"  {C.DIM}/mcp auto       - Tất cả servers{C.RESET}")
-                    print()
+                        print()
+                        print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
+                        print(f"  {C.BOLD}MCP SERVERS & TOOLS{C.RESET}")
+                        print(f"{C.CYAN}{'─' * 60}{C.RESET}")
+                        if client.mcp_manager:
+                            client.mcp_manager.display_tools()
+                        else:
+                            print(f"  {C.YELLOW}MCP module chua duoc cai dat.{C.RESET}")
+                        print(f"{C.BOLD}{C.CYAN}{'═' * 60}{C.RESET}")
+                        print(f"  {C.DIM}/mcp add <dir> | /mcp fetch | /mcp shell | /mcp auto{C.RESET}")
+                        print()
 
             else:
                 print(f"{C.YELLOW}[!] Lệnh không hợp lệ: {cmd}{C.RESET}")
@@ -2617,7 +3123,10 @@ def main():
             continue
 
         print()
-        print(f"{C.BLUE}🤖 Copilot:{C.RESET}")
+        if HAS_RICH:
+            console.print(Rule("Copilot", style="blue"))
+        else:
+            print(f"{C.BLUE}Copilot:{C.RESET}")
         try:
             client.chat(user_input)
         except KeyboardInterrupt:
