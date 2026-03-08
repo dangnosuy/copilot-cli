@@ -26,6 +26,7 @@ import time
 import uuid
 import os
 import re
+import asyncio
 from typing import Optional, Dict, Tuple
 
 from fastapi import FastAPI, Request, HTTPException
@@ -41,6 +42,26 @@ COPILOT_TOKEN_ENDPOINT = "/copilot_internal/v2/token"
 GITHUB_API_VERSION = "2025-04-01"
 COPILOT_API_VERSION = "2025-07-16"
 USER_AGENT = "GitHubCopilotChat/0.31.5"
+
+# ═══════════════════════════════════════════════════════════════
+# TIMEOUT & RETRY CONFIG
+# ═══════════════════════════════════════════════════════════════
+# Opus models can take 3-5 minutes for complex prompts
+UPSTREAM_TIMEOUT = httpx.Timeout(
+    connect=15.0,    # 15s to establish connection
+    read=300.0,      # 5 min to wait for response (opus is slow)
+    write=30.0,      # 30s to send request body
+    pool=15.0,       # 15s to acquire connection from pool
+)
+STREAM_TIMEOUT = httpx.Timeout(
+    connect=15.0,
+    read=300.0,      # 5 min — streaming first byte can be slow too
+    write=30.0,
+    pool=15.0,
+)
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2.0   # seconds, exponential backoff: 2s, 4s, 8s
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # ═══════════════════════════════════════════════════════════════
 # BILLING BYPASS — Persistent session IDs + agent initiator
@@ -1002,7 +1023,7 @@ async def create_message(request: Request):
 
             async with httpx.AsyncClient() as client:
                 try:
-                    async with client.stream("POST", url, headers=headers, json=openai_body, timeout=120) as resp:
+                    async with client.stream("POST", url, headers=headers, json=openai_body, timeout=STREAM_TIMEOUT) as resp:
                         if resp.status_code != 200:
                             err_bytes = await resp.aread()
                             err_msg = err_bytes.decode("utf-8", errors="replace")[:500]
@@ -1175,7 +1196,19 @@ async def create_message(request: Request):
                     print(f"  ✗ Request timeout (stream)")
                     yield _sse_event("error", {
                         "type": "error",
-                        "error": {"type": "api_error", "message": "Request timeout"}
+                        "error": {"type": "overloaded_error", "message": "Upstream server timeout (stream). The model may be overloaded — please retry."}
+                    })
+                except (httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                    print(f"  ✗ Connection timeout (stream): {type(e).__name__}")
+                    yield _sse_event("error", {
+                        "type": "error",
+                        "error": {"type": "overloaded_error", "message": f"Upstream connection timeout: {type(e).__name__}. Please retry."}
+                    })
+                except httpx.HTTPError as e:
+                    print(f"  ✗ HTTP error (stream): {e}")
+                    yield _sse_event("error", {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": f"Upstream error: {e}"}
                     })
 
         return StreamingResponse(
@@ -1188,28 +1221,92 @@ async def create_message(request: Request):
         )
 
     else:
-        # Non-streaming
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, headers=headers, json=openai_body, timeout=120)
-
-        if resp.status_code != 200:
+        # Non-streaming — with retry logic for transient errors
+        last_err = None
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                err = resp.json()
-                err_msg = err.get("error", {}).get("message", resp.text[:500])
-            except Exception:
-                err_msg = resp.text[:500]
-            print(f"  ✗ Upstream error HTTP {resp.status_code}: {err_msg}")
-            raise HTTPException(status_code=resp.status_code, detail={
-                "type": "error",
-                "error": {"type": "api_error", "message": err_msg}
-            })
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(url, headers=headers, json=openai_body, timeout=UPSTREAM_TIMEOUT)
 
-        raw = resp.json()
-        anthropic_resp = openai_to_anthropic_response(raw, model_requested)
-        usage = anthropic_resp.get("usage", {})
-        print(f"  ✓ Response OK | stop_reason: {anthropic_resp.get('stop_reason')} | usage: in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}")
+                if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                    try:
+                        err = resp.json()
+                        err_msg = err.get("error", {}).get("message", resp.text[:200])
+                    except Exception:
+                        err_msg = resp.text[:200]
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} got HTTP {resp.status_code}: {err_msg}")
+                    print(f"    Retrying in {delay:.0f}s...")
+                    await asyncio.sleep(delay)
+                    # Refresh Copilot token in case it expired during wait
+                    copilot_token, api_base = await exchange_token(github_token)
+                    headers = copilot_headers(copilot_token)
+                    url = f"{api_base}/chat/completions"
+                    continue
+
+                if resp.status_code != 200:
+                    try:
+                        err = resp.json()
+                        err_msg = err.get("error", {}).get("message", resp.text[:500])
+                    except Exception:
+                        err_msg = resp.text[:500]
+                    print(f"  ✗ Upstream error HTTP {resp.status_code}: {err_msg}")
+                    raise HTTPException(status_code=resp.status_code, detail={
+                        "type": "error",
+                        "error": {"type": "api_error", "message": err_msg}
+                    })
+
+                raw = resp.json()
+                anthropic_resp = openai_to_anthropic_response(raw, model_requested)
+                usage = anthropic_resp.get("usage", {})
+                print(f"  ✓ Response OK (attempt {attempt}) | stop_reason: {anthropic_resp.get('stop_reason')} | usage: in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}")
+                return JSONResponse(
+                    content=anthropic_resp,
+                    headers={"anthropic-version": "2023-06-01"},
+                )
+
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                last_err = e
+                timeout_type = type(e).__name__
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} {timeout_type}: {e}")
+                    print(f"    Retrying in {delay:.0f}s...")
+                    await asyncio.sleep(delay)
+                    # Refresh Copilot token in case it expired
+                    copilot_token, api_base = await exchange_token(github_token)
+                    headers = copilot_headers(copilot_token)
+                    url = f"{api_base}/chat/completions"
+                    continue
+                else:
+                    print(f"  ✗ All {MAX_RETRIES} attempts failed with {timeout_type}")
+
+            except httpx.HTTPError as e:
+                last_err = e
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} HTTPError: {e}")
+                    print(f"    Retrying in {delay:.0f}s...")
+                    await asyncio.sleep(delay)
+                    copilot_token, api_base = await exchange_token(github_token)
+                    headers = copilot_headers(copilot_token)
+                    url = f"{api_base}/chat/completions"
+                    continue
+                else:
+                    print(f"  ✗ All {MAX_RETRIES} attempts failed with HTTPError: {e}")
+
+        # All retries exhausted — return Anthropic-format error (not 500 crash)
+        err_detail = str(last_err) if last_err else "Unknown error"
+        print(f"  ✗ Request failed after {MAX_RETRIES} retries: {err_detail}")
         return JSONResponse(
-            content=anthropic_resp,
+            status_code=529,  # Anthropic overloaded status code
+            content={
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": f"Upstream server timeout after {MAX_RETRIES} retries. The model may be overloaded — please retry. Detail: {err_detail}",
+                }
+            },
             headers={"anthropic-version": "2023-06-01"},
         )
 
