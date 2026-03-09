@@ -22,6 +22,7 @@ Usage:
 """
 
 import json
+import hashlib
 import time
 import uuid
 import os
@@ -67,7 +68,7 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 # Persistent session IDs
 # ═══════════════════════════════════════════════════════════════
 SESSION_ID = f"{uuid.uuid4()}{int(time.time() * 1000)}"
-MACHINE_ID = uuid.uuid4().hex + uuid.uuid4().hex
+MACHINE_ID = hashlib.sha256(uuid.getnode().to_bytes(6, 'big')).hexdigest()
 
 # ═══════════════════════════════════════════════════════════════
 # MODEL MAPPING — Claude Code sends dashes, Copilot uses dots
@@ -477,14 +478,16 @@ def require_auth(request: Request) -> str:
     })
 
 
-def copilot_headers(copilot_token: str) -> dict:
-    """Build headers cho request tới Copilot upstream."""
+def copilot_headers(copilot_token: str, request_id: str = "", interaction_id: str = "") -> dict:
+    """Build headers cho request tới Copilot upstream.
+    request_id và interaction_id giữ nguyên trong cùng 1 interaction (1 lần chat)
+    để Copilot tính là 1 premium request."""
     return {
         "Authorization": f"Bearer {copilot_token}",
-        "X-Request-Id": str(uuid.uuid4()),
+        "X-Request-Id": request_id or str(uuid.uuid4()),
         "X-Interaction-Type": "conversation-agent",
         "OpenAI-Intent": "conversation-agent",
-        "X-Interaction-Id": str(uuid.uuid4()),
+        "X-Interaction-Id": interaction_id or str(uuid.uuid4()),
         "X-Initiator": "agent",
         "VScode-SessionId": SESSION_ID,
         "VScode-MachineId": MACHINE_ID,
@@ -949,8 +952,10 @@ async def create_message(request: Request):
         print(f"\n  ↳ Model: {resolved}")
     print(f"  ↳ Stream: {is_stream} | max_tokens: {body.get('max_tokens', 'N/A')} | messages: {len(body.get('messages', []))} | prompt_limit: {max_prompt:,}")
 
-    # Forward to Copilot
-    headers = copilot_headers(copilot_token)
+    # Forward to Copilot — tạo IDs 1 lần per interaction (1 lần chat = 1 premium request)
+    request_id = str(uuid.uuid4())
+    interaction_id = str(uuid.uuid4())
+    headers = copilot_headers(copilot_token, request_id, interaction_id)
     url = f"{api_base}/chat/completions"
 
     if is_stream:
@@ -1180,7 +1185,7 @@ async def create_message(request: Request):
                     await asyncio.sleep(delay)
                     # Refresh Copilot token in case it expired during wait
                     copilot_token, api_base = await exchange_token(github_token)
-                    headers = copilot_headers(copilot_token)
+                    headers = copilot_headers(copilot_token, request_id, interaction_id)
                     url = f"{api_base}/chat/completions"
                     continue
 
@@ -1215,7 +1220,7 @@ async def create_message(request: Request):
                     await asyncio.sleep(delay)
                     # Refresh Copilot token in case it expired
                     copilot_token, api_base = await exchange_token(github_token)
-                    headers = copilot_headers(copilot_token)
+                    headers = copilot_headers(copilot_token, request_id, interaction_id)
                     url = f"{api_base}/chat/completions"
                     continue
                 else:
@@ -1229,7 +1234,7 @@ async def create_message(request: Request):
                     print(f"    Retrying in {delay:.0f}s...")
                     await asyncio.sleep(delay)
                     copilot_token, api_base = await exchange_token(github_token)
-                    headers = copilot_headers(copilot_token)
+                    headers = copilot_headers(copilot_token, request_id, interaction_id)
                     url = f"{api_base}/chat/completions"
                     continue
                 else:
