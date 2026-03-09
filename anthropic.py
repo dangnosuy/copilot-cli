@@ -478,7 +478,7 @@ def require_auth(request: Request) -> str:
 
 
 def copilot_headers(copilot_token: str) -> dict:
-    """Build headers cho request tới Copilot upstream (billing bypass)."""
+    """Build headers cho request tới Copilot upstream."""
     return {
         "Authorization": f"Bearer {copilot_token}",
         "X-Request-Id": str(uuid.uuid4()),
@@ -717,16 +717,6 @@ def _openai_stop_to_anthropic(finish_reason: str) -> str:
     return mapping.get(finish_reason, "end_turn")
 
 
-def _is_noop_tool_call(tc: dict) -> bool:
-    """Check if a tool_call is the injected noop tool."""
-    fn = tc.get("function", {})
-    return fn.get("name") == "noop"
-
-
-def _filter_noop_tool_calls(tool_calls: list) -> list:
-    """Lọc bỏ noop tool_calls."""
-    return [tc for tc in tool_calls if not _is_noop_tool_call(tc)]
-
 
 def openai_to_anthropic_response(raw: dict, model_requested: str) -> dict:
     """Convert OpenAI chat completion → Anthropic Message response.
@@ -768,8 +758,7 @@ def openai_to_anthropic_response(raw: dict, model_requested: str) -> dict:
 
     # Tool calls → tool_use blocks
     tool_calls = message.get("tool_calls") or []
-    real_calls = _filter_noop_tool_calls(tool_calls)
-    for tc in real_calls:
+    for tc in tool_calls:
         fn = tc.get("function", {})
         try:
             input_data = json.loads(fn.get("arguments", "{}"))
@@ -782,12 +771,12 @@ def openai_to_anthropic_response(raw: dict, model_requested: str) -> dict:
             "input": input_data,
         })
 
-    # Nếu model chỉ gọi noop (không có real content), trả empty text
+    # Nếu không có content, trả empty text
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
 
     # Adjust stop_reason
-    if finish_reason == "tool_calls" and not real_calls:
+    if finish_reason == "tool_calls" and not tool_calls:
         finish_reason = "stop"
 
     # Generate anthropic-style message ID
@@ -1070,10 +1059,6 @@ async def create_message(request: Request):
                                         fn = tc.get("function", {})
                                         fn_name = fn.get("name", "")
 
-                                        # Skip noop tool calls
-                                        if fn_name == "noop":
-                                            continue
-
                                         if tc_index not in first_tool_index_seen:
                                             # New tool call — close previous text block first
                                             if block_started and current_block_type == "text":
@@ -1120,7 +1105,6 @@ async def create_message(request: Request):
 
                                 # ─── Finish reason ───
                                 if finish:
-                                    # Convert noop-only tool_calls finish to stop
                                     if finish == "tool_calls":
                                         # Check if we had any real tool calls
                                         if not first_tool_index_seen:
