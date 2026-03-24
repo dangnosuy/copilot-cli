@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-GitHub Copilot Proxy — Anthropic-Compatible API Server
-=======================================================
+GitHub Copilot Proxy — Anthropic-Compatible API Server (CLI Identity)
+=====================================================================
 Proxy nhận request theo format Anthropic Messages API,
 convert sang OpenAI format, forward tới Copilot, rồi
 convert response ngược lại thành Anthropic format.
+
+*** Giả dạng GitHub Copilot CLI chính chủ ***
+- Dùng gho_ token trực tiếp (KHÔNG exchange sang JWT)
+- Headers, User-Agent, Integration-Id giống hệt CLI thật
+- Dựa trên traffic capture từ Copilot CLI v1.0.10
 
 Người dùng có thể dùng Anthropic SDK (anthropic Python lib)
 trỏ về server này, sử dụng GitHub token làm api_key.
 
 Usage:
-  curl http://localhost:5001/v1/messages \\
+  curl http://localhost:5005/v1/messages \\
     -H "x-api-key: gho_xxxYOUR_TOKEN" \\
     -H "anthropic-version: 2023-06-01" \\
     -H "Content-Type: application/json" \\
@@ -27,6 +32,7 @@ import time
 import uuid
 import os
 import re
+import platform
 import asyncio
 from typing import Optional, Dict, Tuple
 
@@ -36,96 +42,90 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
 # ═══════════════════════════════════════════════════════════════
-# CONSTANTS
+# CONSTANTS — Giả dạng Copilot CLI chính chủ
 # ═══════════════════════════════════════════════════════════════
 GITHUB_API = "https://api.github.com"
-COPILOT_TOKEN_ENDPOINT = "/copilot_internal/v2/token"
-GITHUB_API_VERSION = "2025-04-01"
-COPILOT_API_VERSION = "2025-07-16"
-USER_AGENT = "GitHubCopilotChat/0.31.5"
+COPILOT_API = "https://api.individual.githubcopilot.com"
+
+# CLI identity — copy chính xác từ traffic capture
+CLI_VERSION = "1.0.10"
+_os_name = "linux" if platform.system() == "Linux" else platform.system().lower()
+_node_version = "v24.11.1"
+
+# User-Agent giống hệt CLI thật (2 dạng)
+USER_AGENT = f"copilot/{CLI_VERSION} ({_os_name} {_node_version}) term/unknown"
+USER_AGENT_CHAT = f"copilot/{CLI_VERSION} (client/github/cli {_os_name} {_node_version}) term/unknown"
+
+# API version CLI dùng (KHÁC với VSCode)
+GITHUB_API_VERSION = "2025-05-01"
 
 # ═══════════════════════════════════════════════════════════════
 # TIMEOUT & RETRY CONFIG
 # ═══════════════════════════════════════════════════════════════
-# Opus models can take 3-5 minutes for complex prompts
 UPSTREAM_TIMEOUT = httpx.Timeout(
-    connect=15.0,    # 15s to establish connection
-    read=300.0,      # 5 min to wait for response (opus is slow)
-    write=30.0,      # 30s to send request body
-    pool=15.0,       # 15s to acquire connection from pool
+    connect=15.0,
+    read=300.0,      # 5 min — opus is slow
+    write=30.0,
+    pool=15.0,
 )
 STREAM_TIMEOUT = httpx.Timeout(
     connect=15.0,
-    read=300.0,      # 5 min — streaming first byte can be slow too
+    read=300.0,
     write=30.0,
     pool=15.0,
 )
 MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0   # seconds, exponential backoff: 2s, 4s, 8s
+RETRY_BASE_DELAY = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # ═══════════════════════════════════════════════════════════════
-# Persistent session IDs
+# Persistent session IDs — giống CLI thật
 # ═══════════════════════════════════════════════════════════════
-SESSION_ID = f"{uuid.uuid4()}{int(time.time() * 1000)}"
+SESSION_ID = str(uuid.uuid4())
 MACHINE_ID = hashlib.sha256(uuid.getnode().to_bytes(6, 'big')).hexdigest()
 
 # ═══════════════════════════════════════════════════════════════
 # MODEL MAPPING — Claude Code sends dashes, Copilot uses dots
-# Claude Code:  claude-opus-4-6,  claude-sonnet-4-6,  claude-haiku-4-5
-# Copilot API:  claude-opus-4.6,  claude-sonnet-4.6,  claude-haiku-4.5
 # ═══════════════════════════════════════════════════════════════
 MODEL_MAP = {
-    # Claude Code aliases → Copilot API model IDs
     # Opus
     "claude-opus-4-6":          "claude-opus-4.6",
-    "claude-opus-4-5":          "claude-opus-4.5",
-    "claude-opus-4-0":          "claude-opus-4.5",
+    "claude-opus-4-5":          "claude-opus-4.6",
+    "claude-opus-4-0":          "claude-opus-4.6",
     # Sonnet
     "claude-sonnet-4-6":        "claude-sonnet-4.6",
-    "claude-sonnet-4-5":        "claude-sonnet-4.5",
-    "claude-sonnet-4-0":        "claude-sonnet-4",
-    "claude-sonnet-4":          "claude-sonnet-4",
+    "claude-sonnet-4-5":        "claude-sonnet-4.6",
+    "claude-sonnet-4-0":        "claude-sonnet-4.6",
+    "claude-sonnet-4":          "claude-sonnet-4.6",
     # Haiku
     "claude-haiku-4-5":         "claude-haiku-4.5",
     "claude-haiku-3-5":         "claude-haiku-4.5",
-    # Pass-through — already correct format
+    # Pass-through
     "claude-opus-4.6":          "claude-opus-4.6",
-    "claude-opus-4.5":          "claude-opus-4.5",
+    "claude-opus-4.5":          "claude-opus-4.6",
     "claude-sonnet-4.6":        "claude-sonnet-4.6",
-    "claude-sonnet-4.5":        "claude-sonnet-4.5",
+    "claude-sonnet-4.5":        "claude-sonnet-4.6",
     "claude-haiku-4.5":         "claude-haiku-4.5",
 }
 
-# Regex: strip date suffix like -20251001 or -20250514
 _DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
 
 
 def resolve_model(model_name: str) -> str:
-    """Map Claude Code model name → Copilot API model ID.
-    Handles date suffixes (e.g. claude-haiku-4-5-20251001 → claude-haiku-4.5).
-    Falls back to the original name if not in map."""
-    # Direct match first
+    """Map Claude Code model name → Copilot API model ID."""
     if model_name in MODEL_MAP:
         return MODEL_MAP[model_name]
-
-    # Strip date suffix and try again
     stripped = _DATE_SUFFIX_RE.sub("", model_name)
     if stripped in MODEL_MAP:
         return MODEL_MAP[stripped]
-
-    # Generic fallback: convert dashes in version to dots
-    # e.g. claude-something-4-6 → claude-something-4.6
     m = re.match(r"^(claude-\w+)-(\d+)-(\d+)$", stripped)
     if m:
         return f"{m.group(1)}-{m.group(2)}.{m.group(3)}"
-
     return model_name
 
 
 # ═══════════════════════════════════════════════════════════════
-# MODEL PROMPT LIMITS — max_prompt_tokens per Copilot model
-# Loaded from models_with_billing.json at startup
+# MODEL PROMPT LIMITS
 # ═══════════════════════════════════════════════════════════════
 _MODEL_PROMPT_LIMITS: Dict[str, int] = {}
 
@@ -165,34 +165,22 @@ def get_model_prompt_limit(model_id: str) -> int:
 
 # ═══════════════════════════════════════════════════════════════
 # TOKEN ESTIMATION & MESSAGE TRUNCATION
-# Strategy (inspired by GitHub Copilot CLI):
-#   Pass 0: Check if within limit → return as-is
-#   Pass 1: Truncate old tool_result / long text content
-#   Pass 2: Drop oldest conversation turns (keep first + last N)
-#   Pass 3: Emergency — keep only last 5 messages
-#
-# KEY INSIGHT: Our token estimate (~3 chars/token) is rough.
-# Copilot uses real tokenizer which may count MORE tokens.
-# So we use a safety margin (0.85x) to avoid edge cases where
-# our estimate says "OK" but Copilot says "too many".
+# (Giữ nguyên logic từ server-anthropic.py)
 # ═══════════════════════════════════════════════════════════════
 
-SAFETY_MARGIN = 0.85  # Use only 85% of max_prompt_tokens to account for estimation error
+SAFETY_MARGIN = 0.85
 
 
 def _estimate_tokens_text(text: str) -> int:
-    """Estimate token count. Conservative: ~3 chars per token."""
     if not text:
         return 0
     return len(text) // 3
 
 
 def _estimate_anthropic_message_tokens(msg: dict) -> int:
-    """Estimate tokens for one Anthropic-format message."""
     content = msg.get("content", "")
     if isinstance(content, str):
         return _estimate_tokens_text(content)
-
     if isinstance(content, list):
         total = 0
         for block in content:
@@ -211,16 +199,14 @@ def _estimate_anthropic_message_tokens(msg: dict) -> int:
                         if ib.get("type") == "text":
                             total += _estimate_tokens_text(ib.get("text", ""))
             elif btype == "image":
-                total += 1000  # rough estimate for images
+                total += 1000
             else:
                 total += _estimate_tokens_text(json.dumps(block))
         return total
-
     return 0
 
 
 def _estimate_system_tokens(system) -> int:
-    """Estimate tokens for the system prompt."""
     if isinstance(system, str):
         return _estimate_tokens_text(system)
     if isinstance(system, list):
@@ -229,14 +215,12 @@ def _estimate_system_tokens(system) -> int:
 
 
 def _estimate_tools_tokens(tools: list) -> int:
-    """Estimate tokens for tool definitions."""
     if not tools:
         return 0
     return _estimate_tokens_text(json.dumps(tools))
 
 
 def _truncate_tool_result_content(block: dict, max_chars: int = 500) -> dict:
-    """Truncate a tool_result content block if too long."""
     inner = block.get("content", "")
     if isinstance(inner, str) and len(inner) > max_chars * 1.5:
         block = dict(block)
@@ -266,23 +250,16 @@ def truncate_messages_for_context(
     tools: list,
     max_prompt_tokens: int,
 ) -> tuple:
-    """Truncate Anthropic messages to fit within max_prompt_tokens.
-
-    Returns (truncated_messages, was_truncated, stats_dict).
-    """
-    # Apply safety margin — our estimate is rough, real tokenizer counts more
+    """Truncate Anthropic messages to fit within max_prompt_tokens."""
     effective_limit = int(max_prompt_tokens * SAFETY_MARGIN)
-
-    # Reserve tokens for system + tools + overhead
     system_tokens = _estimate_system_tokens(system)
     tools_tokens = _estimate_tools_tokens(tools)
-    overhead = 500  # formatting overhead
+    overhead = 500
     available = effective_limit - system_tokens - tools_tokens - overhead
 
     if available <= 0:
         available = effective_limit // 2
 
-    # Calculate total message tokens
     msg_tokens = [_estimate_anthropic_message_tokens(m) for m in messages]
     total = sum(msg_tokens)
 
@@ -309,7 +286,6 @@ def truncate_messages_for_context(
         msg = result[i]
         content = msg.get("content")
 
-        # Truncate long string content in old messages
         if isinstance(content, str) and len(content) > 2000:
             result[i] = dict(msg)
             result[i]["content"] = content[:1500] + "\n... [truncated] ..."
@@ -350,7 +326,6 @@ def truncate_messages_for_context(
             result[i] = dict(msg)
             result[i]["content"] = new_content
 
-    # Recalculate
     total = sum(_estimate_anthropic_message_tokens(m) for m in result)
 
     if total <= available:
@@ -365,7 +340,6 @@ def truncate_messages_for_context(
         if len(result) <= keep_last + 2:
             continue
 
-        # Find safe cut point — don't break tool call chains
         cut_end = len(result) - keep_last
         while cut_end > 1:
             msg = result[cut_end]
@@ -406,63 +380,58 @@ def truncate_messages_for_context(
 
 
 # ═══════════════════════════════════════════════════════════════
-# SESSION CACHE  (github_token -> (copilot_token, api_base, expires_at))
+# AUTH — CLI style: gho_ token dùng TRỰC TIẾP
+# KHÔNG exchange sang JWT như VSCode
 # ═══════════════════════════════════════════════════════════════
-_token_cache: Dict[str, Tuple[str, str, int]] = {}
+
+async def validate_token(github_token: str) -> bool:
+    """Kiểm tra gho_ token còn hợp lệ qua GET /copilot_internal/user."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{GITHUB_API}/copilot_internal/user",
+                headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "Accept": "application/json",
+                    "User-Agent": USER_AGENT,
+                },
+                timeout=15,
+            )
+        return resp.status_code == 200
+    except Exception:
+        return False
 
 
-async def exchange_token(github_token: str) -> Tuple[str, str]:
-    """Đổi GitHub token -> Copilot session token + api_base."""
-    cached = _token_cache.get(github_token)
-    if cached:
-        copilot_token, api_base, expires_at = cached
-        if time.time() < expires_at - 300:
-            return copilot_token, api_base
+# Cache token validation — avoid hitting /copilot_internal/user every request
+_validated_tokens: Dict[str, float] = {}  # token → last_validated_time
+_VALIDATION_TTL = 3600  # Re-validate every 1 hour
 
-    url = f"{GITHUB_API}{COPILOT_TOKEN_ENDPOINT}"
-    headers = {
-        "Authorization": f"token {github_token}",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": USER_AGENT,
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, headers=headers, timeout=15)
 
-    if resp.status_code == 401:
+async def ensure_valid_token(github_token: str):
+    """Validate token, cache result. Raise 401 if invalid."""
+    now = time.time()
+    cached_time = _validated_tokens.get(github_token)
+    if cached_time and (now - cached_time) < _VALIDATION_TTL:
+        return  # Still valid
+
+    if not await validate_token(github_token):
         raise HTTPException(status_code=401, detail={
             "type": "error",
             "error": {
                 "type": "authentication_error",
-                "message": "Invalid API key. Please check your x-api-key header.",
-            }
-        })
-    if resp.status_code != 200:
-        raise HTTPException(status_code=401, detail={
-            "type": "error",
-            "error": {
-                "type": "authentication_error",
-                "message": f"GitHub token exchange failed (HTTP {resp.status_code})",
+                "message": "Invalid API key. GitHub token (gho_xxx) is invalid or expired.",
             }
         })
 
-    data = resp.json()
-    copilot_token = data["token"]
-    api_base = data.get("endpoints", {}).get("api", "https://api.individual.githubcopilot.com")
-    expires_at = data.get("expires_at", 0)
-
-    _token_cache[github_token] = (copilot_token, api_base, expires_at)
-    return copilot_token, api_base
+    _validated_tokens[github_token] = now
 
 
 def require_auth(request: Request) -> str:
-    """Extract GitHub token từ x-api-key hoặc Authorization header.
-    Anthropic SDK gửi qua x-api-key header."""
-    # Anthropic style: x-api-key header
+    """Extract GitHub token từ x-api-key hoặc Authorization header."""
     token = request.headers.get("x-api-key", "").strip()
     if token:
         return token
 
-    # Fallback: Authorization: Bearer xxx
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
@@ -478,59 +447,48 @@ def require_auth(request: Request) -> str:
     })
 
 
-def copilot_headers(copilot_token: str, request_id: str = "", interaction_id: str = "") -> dict:
-    """Build headers cho request tới Copilot upstream.
-    request_id và interaction_id giữ nguyên trong cùng 1 interaction (1 lần chat)
-    để Copilot tính là 1 premium request."""
+def copilot_headers(github_token: str, interaction_id: str = "", initiator: str = "user") -> dict:
+    """Build headers giả dạng Copilot CLI chính chủ.
+
+    KEY DIFFERENCE vs server-anthropic.py:
+    - Dùng gho_ token trực tiếp (KHÔNG JWT)
+    - Copilot-Integration-Id: copilot-developer-cli (KHÔNG vscode-chat)
+    - KHÔNG có Editor-Version, Editor-Plugin-Version, VScode-*
+    - User-Agent format CLI
+    - X-GitHub-Api-Version: 2025-05-01 (KHÔNG 2025-07-16)
+    """
     return {
-        "Authorization": f"Bearer {copilot_token}",
-        "X-Request-Id": request_id or str(uuid.uuid4()),
-        "X-Interaction-Type": "conversation-agent",
-        "OpenAI-Intent": "conversation-agent",
-        "X-Interaction-Id": interaction_id or str(uuid.uuid4()),
-        "X-Initiator": "agent",
-        "VScode-SessionId": SESSION_ID,
-        "VScode-MachineId": MACHINE_ID,
-        "X-GitHub-Api-Version": COPILOT_API_VERSION,
-        "Editor-Plugin-Version": "copilot-chat/0.31.5",
-        "Editor-Version": "vscode/1.104.1",
-        "Copilot-Integration-Id": "vscode-chat",
-        "User-Agent": USER_AGENT,
+        "Authorization": f"Bearer {github_token}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT_CHAT,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "Copilot-Integration-Id": "copilot-developer-cli",
+        "OpenAI-Intent": "conversation-agent",
+        "X-Initiator": "agent",
+        "X-Interaction-Id": interaction_id or str(uuid.uuid4()),
+        "X-Interaction-Type": "conversation-user",
+        "X-Client-Session-Id": SESSION_ID,
     }
 
 
 # ═══════════════════════════════════════════════════════════════
 # FORMAT CONVERSION: Anthropic → OpenAI (request)
+# (Giữ nguyên 100% logic từ server-anthropic.py)
 # ═══════════════════════════════════════════════════════════════
 
 def anthropic_to_openai_messages(anthropic_messages: list) -> list:
-    """Convert Anthropic messages format → OpenAI messages format.
-    
-    Anthropic: {"role": "user", "content": "text"} hoặc
-               {"role": "user", "content": [{"type": "text", "text": "..."}]}
-    OpenAI:    {"role": "user", "content": "text"} hoặc
-               {"role": "user", "content": [{"type": "text", "text": "..."}]}
-    
-    Tool use cũng cần convert:
-    Anthropic assistant: content=[{type: "tool_use", id, name, input}]
-    OpenAI assistant:    tool_calls=[{id, type: "function", function: {name, arguments}}]
-    
-    Anthropic tool_result: {role: "user", content: [{type: "tool_result", tool_use_id, content}]}
-    OpenAI tool:           {role: "tool", tool_call_id, content}
-    """
+    """Convert Anthropic messages format → OpenAI messages format."""
     openai_msgs = []
 
     for msg in anthropic_messages:
         role = msg.get("role", "user")
         content = msg.get("content")
 
-        # Simple string content
         if isinstance(content, str):
             openai_msgs.append({"role": role, "content": content})
             continue
 
-        # Array content blocks
         if isinstance(content, list):
             text_parts = []
             image_parts = []
@@ -542,9 +500,7 @@ def anthropic_to_openai_messages(anthropic_messages: list) -> list:
 
                 if block_type == "text":
                     text_parts.append(block.get("text", ""))
-
                 elif block_type == "image":
-                    # Anthropic image → OpenAI image_url
                     source = block.get("source", {})
                     if source.get("type") == "base64":
                         media_type = source.get("media_type", "image/png")
@@ -558,19 +514,15 @@ def anthropic_to_openai_messages(anthropic_messages: list) -> list:
                             "type": "image_url",
                             "image_url": {"url": source.get("url", "")}
                         })
-
                 elif block_type == "tool_use":
                     tool_uses.append(block)
-
                 elif block_type == "tool_result":
                     tool_results.append(block)
 
-            # Tool results → separate OpenAI tool messages
             if tool_results:
                 for tr in tool_results:
                     tr_content = tr.get("content", "")
                     if isinstance(tr_content, list):
-                        # Extract text from content blocks
                         tr_content = " ".join(
                             b.get("text", "") for b in tr_content
                             if b.get("type") == "text"
@@ -582,7 +534,6 @@ def anthropic_to_openai_messages(anthropic_messages: list) -> list:
                     })
                 continue
 
-            # Assistant with tool_use → OpenAI tool_calls
             if role == "assistant" and tool_uses:
                 oai_msg = {
                     "role": "assistant",
@@ -601,7 +552,6 @@ def anthropic_to_openai_messages(anthropic_messages: list) -> list:
                 openai_msgs.append(oai_msg)
                 continue
 
-            # Regular message with text + optional images
             if image_parts:
                 parts = []
                 if text_parts:
@@ -617,17 +567,11 @@ def anthropic_to_openai_messages(anthropic_messages: list) -> list:
 
 
 def anthropic_to_openai_tools(anthropic_tools: list) -> list:
-    """Convert Anthropic tools → OpenAI tools format.
-    
-    Anthropic: {"name": "get_weather", "description": "...", "input_schema": {...}}
-    OpenAI:    {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
-    """
+    """Convert Anthropic tools → OpenAI tools format."""
     openai_tools = []
     for tool in anthropic_tools:
-        # Skip special Anthropic tools (bash, text_editor, etc.)
         if tool.get("type") in ("bash_20250124", "text_editor_20250124", "computer_20250124"):
             continue
-
         openai_tools.append({
             "type": "function",
             "function": {
@@ -647,46 +591,35 @@ def anthropic_to_openai_request(body: dict) -> dict:
         "max_tokens": body.get("max_tokens", 4096),
     }
 
-    # System prompt
     system = body.get("system")
     if system:
         if isinstance(system, str):
             openai_body["messages"].append({"role": "system", "content": system})
         elif isinstance(system, list):
-            # Array of text blocks
             sys_text = " ".join(
                 b.get("text", "") for b in system if b.get("type") == "text"
             )
             if sys_text:
                 openai_body["messages"].append({"role": "system", "content": sys_text})
 
-    # Messages
     openai_body["messages"].extend(
         anthropic_to_openai_messages(body.get("messages", []))
     )
 
-    # Temperature
     if "temperature" in body:
         openai_body["temperature"] = body["temperature"]
-
-    # Top P
     if "top_p" in body:
         openai_body["top_p"] = body["top_p"]
-
-    # Stop sequences
     if "stop_sequences" in body:
         openai_body["stop"] = body["stop_sequences"]
 
-    # Stream
     if body.get("stream"):
         openai_body["stream"] = True
         openai_body["stream_options"] = {"include_usage": True}
 
-    # Tools
     if body.get("tools"):
         openai_body["tools"] = anthropic_to_openai_tools(body["tools"])
 
-    # Tool choice
     tc = body.get("tool_choice")
     if tc:
         tc_type = tc.get("type", "auto")
@@ -710,7 +643,6 @@ def anthropic_to_openai_request(body: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def _openai_stop_to_anthropic(finish_reason: str) -> str:
-    """Convert OpenAI finish_reason → Anthropic stop_reason."""
     mapping = {
         "stop": "end_turn",
         "length": "max_tokens",
@@ -720,46 +652,19 @@ def _openai_stop_to_anthropic(finish_reason: str) -> str:
     return mapping.get(finish_reason, "end_turn")
 
 
-
 def openai_to_anthropic_response(raw: dict, model_requested: str) -> dict:
-    """Convert OpenAI chat completion → Anthropic Message response.
-    
-    OpenAI:
-    {
-      "id": "chatcmpl-xxx",
-      "choices": [{"message": {"role": "assistant", "content": "...", "tool_calls": [...]}, "finish_reason": "stop"}],
-      "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
-    }
-    
-    Anthropic:
-    {
-      "id": "msg_xxx",
-      "type": "message",
-      "role": "assistant",
-      "model": "claude-sonnet-4",
-      "content": [{"type": "text", "text": "..."}],
-      "stop_reason": "end_turn",
-      "stop_sequence": null,
-      "usage": {"input_tokens": 10, "output_tokens": 20}
-    }
-    """
+    """Convert OpenAI chat completion → Anthropic Message response."""
     choice = (raw.get("choices") or [{}])[0]
     message = choice.get("message", {})
     finish_reason = choice.get("finish_reason", "stop")
     usage = raw.get("usage", {})
 
-    # Build content blocks
     content_blocks = []
 
-    # Text content
     text = message.get("content")
     if text:
-        content_blocks.append({
-            "type": "text",
-            "text": text,
-        })
+        content_blocks.append({"type": "text", "text": text})
 
-    # Tool calls → tool_use blocks
     tool_calls = message.get("tool_calls") or []
     for tc in tool_calls:
         fn = tc.get("function", {})
@@ -774,15 +679,12 @@ def openai_to_anthropic_response(raw: dict, model_requested: str) -> dict:
             "input": input_data,
         })
 
-    # Nếu không có content, trả empty text
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
 
-    # Adjust stop_reason
     if finish_reason == "tool_calls" and not tool_calls:
         finish_reason = "stop"
 
-    # Generate anthropic-style message ID
     msg_id = raw.get("id", "")
     if not msg_id.startswith("msg_"):
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -804,26 +706,16 @@ def openai_to_anthropic_response(raw: dict, model_requested: str) -> dict:
 
 # ═══════════════════════════════════════════════════════════════
 # STREAMING: OpenAI SSE → Anthropic SSE
-# Anthropic streaming events:
-#   1. message_start   — full message skeleton with usage.input_tokens
-#   2. content_block_start — {type: "text", text: ""} or {type: "tool_use",...}
-#   3. content_block_delta — {type: "text_delta", text: "chunk"} or
-#                            {type: "input_json_delta", partial_json: "..."}
-#   4. content_block_stop  — end of content block
-#   5. message_delta   — stop_reason + usage.output_tokens
-#   6. message_stop    — end of stream
 # ═══════════════════════════════════════════════════════════════
 
 def _sse_event(event_type: str, data: dict) -> str:
-    """Format 1 Anthropic SSE event."""
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
 
 
 # ═══════════════════════════════════════════════════════════════
 # APP
 # ═══════════════════════════════════════════════════════════════
-app = FastAPI(title="GitHub Copilot Proxy — Anthropic Compatible", version="1.0.0")
+app = FastAPI(title="GitHub Copilot Proxy — CLI Identity", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -831,21 +723,21 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 def root():
     return {
         "status": "running",
-        "service": "GitHub Copilot Proxy — Anthropic Compatible",
+        "service": "GitHub Copilot Proxy — CLI Identity",
+        "identity": "copilot-developer-cli",
+        "note": "Uses gho_ token directly (no JWT exchange)",
         "usage": "Set api_key to your GitHub token (gho_xxx), base_url to http://localhost:{port}",
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# COUNT TOKENS — Required by Claude Code gateway spec
+# COUNT TOKENS
 # ═══════════════════════════════════════════════════════════════
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
-    """Fake count_tokens endpoint required by Claude Code.
-    Returns a reasonable estimate — Copilot doesn't have a native count endpoint."""
+    """Fake count_tokens endpoint required by Claude Code."""
     github_token = require_auth(request)
-    # Validate token still works
-    await exchange_token(github_token)
+    await ensure_valid_token(github_token)
 
     try:
         body = await request.json()
@@ -855,7 +747,6 @@ async def count_tokens(request: Request):
             "error": {"type": "invalid_request_error", "message": "Invalid JSON body"}
         })
 
-    # Rough estimate: 4 chars ≈ 1 token
     total_chars = 0
     system = body.get("system", "")
     if isinstance(system, str):
@@ -873,25 +764,24 @@ async def count_tokens(request: Request):
                 if b.get("type") == "text":
                     total_chars += len(b.get("text", ""))
 
-    # Add tool definitions size
     for tool in body.get("tools", []):
         total_chars += len(json.dumps(tool))
 
     estimated_tokens = max(1, total_chars // 4)
 
-    return JSONResponse(content={
-        "input_tokens": estimated_tokens,
-    })
+    return JSONResponse(content={"input_tokens": estimated_tokens})
 
 
+# ═══════════════════════════════════════════════════════════════
+# MAIN ENDPOINT — /v1/messages
+# ═══════════════════════════════════════════════════════════════
 @app.post("/v1/messages")
 async def create_message(request: Request):
     """Anthropic Messages API compatible endpoint.
-    Nhận request theo format Anthropic, convert → OpenAI, forward tới Copilot,
-    rồi convert response ngược lại → Anthropic format."""
+    Giả dạng Copilot CLI khi forward request tới upstream."""
 
     github_token = require_auth(request)
-    copilot_token, api_base = await exchange_token(github_token)
+    await ensure_valid_token(github_token)
 
     try:
         body = await request.json()
@@ -902,26 +792,17 @@ async def create_message(request: Request):
         })
 
     # Validate required fields
-    if "model" not in body:
-        raise HTTPException(status_code=400, detail={
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": "Missing required field: model"}
-        })
-    if "max_tokens" not in body:
-        raise HTTPException(status_code=400, detail={
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": "Missing required field: max_tokens"}
-        })
-    if "messages" not in body:
-        raise HTTPException(status_code=400, detail={
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": "Missing required field: messages"}
-        })
+    for field in ("model", "max_tokens", "messages"):
+        if field not in body:
+            raise HTTPException(status_code=400, detail={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": f"Missing required field: {field}"}
+            })
 
     model_requested = body.get("model", "")
     is_stream = body.get("stream", False)
 
-    # ─── Smart Truncation: fit messages within Copilot's max_prompt_tokens ───
+    # ─── Smart Truncation ───
     resolved = resolve_model(model_requested)
     max_prompt = get_model_prompt_limit(resolved)
 
@@ -942,7 +823,7 @@ async def create_message(request: Request):
         if trunc_stats.get("dropped_messages"):
             print(f"  ⚡ Dropped {trunc_stats['dropped_messages']} old messages")
 
-    # Convert Anthropic request → OpenAI format (AFTER truncation)
+    # Convert Anthropic → OpenAI
     openai_body = anthropic_to_openai_request(body)
 
     # Log
@@ -950,22 +831,21 @@ async def create_message(request: Request):
         print(f"\n  ↳ Model mapped: {model_requested} → {resolved}")
     else:
         print(f"\n  ↳ Model: {resolved}")
-    print(f"  ↳ Stream: {is_stream} | max_tokens: {body.get('max_tokens', 'N/A')} | messages: {len(body.get('messages', []))} | prompt_limit: {max_prompt:,}")
+    print(f"  ↳ Identity: copilot-developer-cli | Stream: {is_stream} | max_tokens: {body.get('max_tokens', 'N/A')} | messages: {len(body.get('messages', []))} | prompt_limit: {max_prompt:,}")
 
-    # Forward to Copilot — tạo IDs 1 lần per interaction (1 lần chat = 1 premium request)
-    request_id = str(uuid.uuid4())
+    # Build CLI-style headers — gho_ token trực tiếp, KHÔNG JWT
     interaction_id = str(uuid.uuid4())
-    headers = copilot_headers(copilot_token, request_id, interaction_id)
-    url = f"{api_base}/chat/completions"
+    headers = copilot_headers(github_token, interaction_id=interaction_id)
+    url = f"{COPILOT_API}/chat/completions"
 
     if is_stream:
         async def generate():
             """Convert OpenAI SSE stream → Anthropic SSE stream."""
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
             content_index = 0
-            current_block_type = None  # "text" or "tool_use"
+            current_block_type = None
             block_started = False
-            tool_call_buffers: Dict[int, dict] = {}  # index → {id, name, arguments_json}
+            tool_call_buffers: Dict[int, dict] = {}
             usage_data = {"input_tokens": 0, "output_tokens": 0}
             stop_reason = "end_turn"
             first_text = True
@@ -1039,7 +919,6 @@ async def create_message(request: Request):
                                 # ─── Text content ───
                                 text_content = delta.get("content")
                                 if text_content is not None:
-                                    # Start text block if needed
                                     if first_text:
                                         yield _sse_event("content_block_start", {
                                             "type": "content_block_start",
@@ -1050,7 +929,7 @@ async def create_message(request: Request):
                                         current_block_type = "text"
                                         block_started = True
 
-                                    if text_content:  # Non-empty text
+                                    if text_content:
                                         yield _sse_event("content_block_delta", {
                                             "type": "content_block_delta",
                                             "index": content_index,
@@ -1065,7 +944,6 @@ async def create_message(request: Request):
                                         fn_name = fn.get("name", "")
 
                                         if tc_index not in first_tool_index_seen:
-                                            # New tool call — close previous text block first
                                             if block_started and current_block_type == "text":
                                                 yield _sse_event("content_block_stop", {
                                                     "type": "content_block_stop",
@@ -1081,7 +959,6 @@ async def create_message(request: Request):
                                                 "arguments_json": "",
                                             }
 
-                                            # Emit content_block_start for tool_use
                                             yield _sse_event("content_block_start", {
                                                 "type": "content_block_start",
                                                 "index": content_index,
@@ -1095,7 +972,6 @@ async def create_message(request: Request):
                                             current_block_type = "tool_use"
                                             block_started = True
 
-                                        # Accumulate arguments
                                         args_chunk = fn.get("arguments", "")
                                         if args_chunk and tc_index in tool_call_buffers:
                                             tool_call_buffers[tc_index]["arguments_json"] += args_chunk
@@ -1111,7 +987,6 @@ async def create_message(request: Request):
                                 # ─── Finish reason ───
                                 if finish:
                                     if finish == "tool_calls":
-                                        # Check if we had any real tool calls
                                         if not first_tool_index_seen:
                                             finish = "stop"
                                     stop_reason = _openai_stop_to_anthropic(finish)
@@ -1123,7 +998,7 @@ async def create_message(request: Request):
                                 "index": content_index,
                             })
 
-                        # ─── message_delta with stop_reason + output_tokens ───
+                        # ─── message_delta ───
                         yield _sse_event("message_delta", {
                             "type": "message_delta",
                             "delta": {
@@ -1166,7 +1041,7 @@ async def create_message(request: Request):
         )
 
     else:
-        # Non-streaming — with retry logic for transient errors
+        # Non-streaming — with retry logic
         last_err = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -1183,10 +1058,8 @@ async def create_message(request: Request):
                     print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} got HTTP {resp.status_code}: {err_msg}")
                     print(f"    Retrying in {delay:.0f}s...")
                     await asyncio.sleep(delay)
-                    # Refresh Copilot token in case it expired during wait
-                    copilot_token, api_base = await exchange_token(github_token)
-                    headers = copilot_headers(copilot_token, request_id, interaction_id)
-                    url = f"{api_base}/chat/completions"
+                    # Re-build headers (same token — CLI doesn't exchange)
+                    headers = copilot_headers(github_token, interaction_id=interaction_id)
                     continue
 
                 if resp.status_code != 200:
@@ -1218,10 +1091,7 @@ async def create_message(request: Request):
                     print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} {timeout_type}: {e}")
                     print(f"    Retrying in {delay:.0f}s...")
                     await asyncio.sleep(delay)
-                    # Refresh Copilot token in case it expired
-                    copilot_token, api_base = await exchange_token(github_token)
-                    headers = copilot_headers(copilot_token, request_id, interaction_id)
-                    url = f"{api_base}/chat/completions"
+                    headers = copilot_headers(github_token, interaction_id=interaction_id)
                     continue
                 else:
                     print(f"  ✗ All {MAX_RETRIES} attempts failed with {timeout_type}")
@@ -1233,23 +1103,21 @@ async def create_message(request: Request):
                     print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} HTTPError: {e}")
                     print(f"    Retrying in {delay:.0f}s...")
                     await asyncio.sleep(delay)
-                    copilot_token, api_base = await exchange_token(github_token)
-                    headers = copilot_headers(copilot_token, request_id, interaction_id)
-                    url = f"{api_base}/chat/completions"
+                    headers = copilot_headers(github_token, interaction_id=interaction_id)
                     continue
                 else:
                     print(f"  ✗ All {MAX_RETRIES} attempts failed with HTTPError: {e}")
 
-        # All retries exhausted — return Anthropic-format error (not 500 crash)
+        # All retries exhausted
         err_detail = str(last_err) if last_err else "Unknown error"
         print(f"  ✗ Request failed after {MAX_RETRIES} retries: {err_detail}")
         return JSONResponse(
-            status_code=529,  # Anthropic overloaded status code
+            status_code=529,
             content={
                 "type": "error",
                 "error": {
                     "type": "overloaded_error",
-                    "message": f"Upstream server timeout after {MAX_RETRIES} retries. The model may be overloaded — please retry. Detail: {err_detail}",
+                    "message": f"Upstream server timeout after {MAX_RETRIES} retries. Detail: {err_detail}",
                 }
             },
             headers={"anthropic-version": "2023-06-01"},
@@ -1258,20 +1126,19 @@ async def create_message(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 5001))
+    port = int(os.environ.get("PORT", 5005))
     print(f"""
 ╔══════════════════════════════════════════════════════╗
-║  GitHub Copilot Proxy — Anthropic Compatible         ║
+║  GitHub Copilot Proxy — CLI Identity                 ║
 ║  http://127.0.0.1:{port}{' ' * (39 - len(str(port)))}║
+╠══════════════════════════════════════════════════════╣
+║  Identity: copilot-developer-cli (NOT vscode)        ║
+║  Auth: gho_ token direct (NO JWT exchange)           ║
+║  API Version: {GITHUB_API_VERSION}{' ' * (39 - len(GITHUB_API_VERSION))}║
+║  User-Agent: {USER_AGENT_CHAT[:39]}{' ' * max(0, 39 - len(USER_AGENT_CHAT[:39]))}║
 ╠══════════════════════════════════════════════════════╣
 ║  POST /v1/messages              - Create Message     ║
 ║  POST /v1/messages/count_tokens - Count Tokens       ║
-╠══════════════════════════════════════════════════════╣
-║  Model Mapping (Claude Code → Copilot):              ║
-║    claude-opus-4-6   → claude-opus-4.6               ║
-║    claude-sonnet-4-6 → claude-sonnet-4.6             ║
-║    claude-sonnet-4   → claude-sonnet-4               ║
-║    claude-haiku-4-5  → claude-haiku-4.5              ║
 ╠══════════════════════════════════════════════════════╣
 ║  x-api-key: gho_xxxYOUR_GITHUB_TOKEN                ║
 ║  anthropic-version: 2023-06-01                       ║
