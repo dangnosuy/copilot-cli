@@ -1268,14 +1268,11 @@ class CopilotClient:
             return False
 
     def _get_chat_models_ordered(self) -> list[dict]:
-        """Lấy danh sách chat models theo thứ tự hiển thị (lightweight → versatile → powerful → other)."""
-        chat_models = [
-            m for m in self.models
-            if m.get("model_picker_enabled", False)
-            and m.get("capabilities", {}).get("type") == "chat"
-        ]
+        """Lấy toàn bộ models theo thứ tự hiển thị (lightweight → versatile → powerful → other)."""
+        # Hiện tất cả models, không lọc theo model_picker_enabled hay type
+        all_models = list(self.models)
         categories = {}
-        for m in chat_models:
+        for m in all_models:
             cat = m.get("model_picker_category", "other")
             categories.setdefault(cat, []).append(m)
 
@@ -1456,10 +1453,10 @@ class CopilotClient:
             print(f"{C.DIM}    Dùng /models để xem danh sách.{C.RESET}")
             return False
 
-        # Kiểm tra có phải chat model không
-        if found.get("capabilities", {}).get("type") != "chat":
-            print(f"{C.RED}[!] Model '{model_id}' không hỗ trợ chat.{C.RESET}")
-            return False
+        # Cảnh báo nếu không phải chat model (nhưng vẫn cho chọn)
+        model_type = found.get("capabilities", {}).get("type", "unknown")
+        if model_type != "chat":
+            print(f"{C.YELLOW}[!] Cảnh báo: Model '{model_id}' có type='{model_type}', có thể không hỗ trợ chat tốt.{C.RESET}")
 
         self.selected_model = found.get("id")
         name = found.get("name", "")
