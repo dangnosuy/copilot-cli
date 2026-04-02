@@ -168,13 +168,40 @@ def get_model_prompt_limit(model_id: str) -> int:
 # (Giữ nguyên logic từ server-anthropic.py)
 # ═══════════════════════════════════════════════════════════════
 
-SAFETY_MARGIN = 0.85
+SAFETY_MARGIN = 0.75  # Conservative margin — estimation can undercount by ~30% for image-heavy content
 
 
 def _estimate_tokens_text(text: str) -> int:
     if not text:
         return 0
     return len(text) // 3
+
+
+def _estimate_image_tokens(block: dict) -> int:
+    """Estimate tokens for an image block more accurately.
+
+    Anthropic counts image tokens based on pixel dimensions.
+    A rough formula: (width * height) / 750 tokens.
+    Since we often don't know dimensions, estimate from base64 data size:
+    - base64 string length * 3/4 = raw bytes
+    - Typical compression: raw_bytes → roughly (raw_bytes / 500) tokens
+    - Minimum 1600 tokens (small image), cap at 6400 (1568x1568 max tile)
+    For URL-type images, use a conservative estimate.
+    """
+    source = block.get("source", {})
+    if source.get("type") == "base64":
+        data = source.get("data", "")
+        # base64 length → raw bytes → estimate tokens
+        raw_bytes = len(data) * 3 // 4
+        # Anthropic's vision: images are resized to fit within tiles of ~1568px
+        # Each tile costs ~1600 tokens. Estimate from byte size:
+        # A typical 1568x1568 PNG ≈ 200-800KB → ~1600 tokens per tile
+        # Conservative: assume 1 tile per 200KB, minimum 1600
+        num_tiles = max(1, raw_bytes // 200_000 + 1)
+        return min(num_tiles * 1600, 6400)  # max 4 tiles
+    elif source.get("type") == "url":
+        return 1600  # conservative single-tile estimate
+    return 1600
 
 
 def _estimate_anthropic_message_tokens(msg: dict) -> int:
@@ -198,8 +225,10 @@ def _estimate_anthropic_message_tokens(msg: dict) -> int:
                     for ib in inner:
                         if ib.get("type") == "text":
                             total += _estimate_tokens_text(ib.get("text", ""))
+                        elif ib.get("type") == "image":
+                            total += _estimate_image_tokens(ib)
             elif btype == "image":
-                total += 1000
+                total += _estimate_image_tokens(block)
             else:
                 total += _estimate_tokens_text(json.dumps(block))
         return total
@@ -278,7 +307,7 @@ def truncate_messages_for_context(
     if total <= available:
         return messages, False, stats
 
-    # ─── Pass 1: Truncate old tool_result / long text content ───
+    # ─── Pass 1: Truncate old tool_result / long text / image content ───
     result = list(messages)
     safe_zone = min(10, len(result))
 
@@ -299,6 +328,25 @@ def truncate_messages_for_context(
         for block in content:
             btype = block.get("type", "")
             if btype == "tool_result":
+                # Also strip images from old tool_result inner content
+                inner = block.get("content", "")
+                if isinstance(inner, list):
+                    new_inner = []
+                    inner_changed = False
+                    for ib in inner:
+                        if ib.get("type") == "image":
+                            # Replace image with text placeholder
+                            new_inner.append({
+                                "type": "text",
+                                "text": "[image removed to save context]"
+                            })
+                            inner_changed = True
+                        else:
+                            new_inner.append(ib)
+                    if inner_changed:
+                        block = dict(block)
+                        block["content"] = new_inner
+                        changed = True
                 new_block = _truncate_tool_result_content(block, max_chars=500)
                 if new_block is not block:
                     changed = True
@@ -314,6 +362,13 @@ def truncate_messages_for_context(
                         block["input"] = {"_truncated": inp_str[:800]}
                     changed = True
                 new_content.append(block)
+            elif btype == "image":
+                # Remove old image blocks, replace with placeholder text
+                new_content.append({
+                    "type": "text",
+                    "text": "[image removed to save context]"
+                })
+                changed = True
             elif btype == "text" and len(block.get("text", "")) > 2000:
                 block = dict(block)
                 block["text"] = block["text"][:1500] + "\n... [truncated] ..."
@@ -755,6 +810,7 @@ async def count_tokens(request: Request):
         for b in system:
             total_chars += len(b.get("text", ""))
 
+    total_image_tokens = 0
     for msg in body.get("messages", []):
         content = msg.get("content", "")
         if isinstance(content, str):
@@ -763,11 +819,23 @@ async def count_tokens(request: Request):
             for b in content:
                 if b.get("type") == "text":
                     total_chars += len(b.get("text", ""))
+                elif b.get("type") == "image":
+                    total_image_tokens += _estimate_image_tokens(b)
+                elif b.get("type") == "tool_result":
+                    inner = b.get("content", "")
+                    if isinstance(inner, str):
+                        total_chars += len(inner)
+                    elif isinstance(inner, list):
+                        for ib in inner:
+                            if ib.get("type") == "text":
+                                total_chars += len(ib.get("text", ""))
+                            elif ib.get("type") == "image":
+                                total_image_tokens += _estimate_image_tokens(ib)
 
     for tool in body.get("tools", []):
         total_chars += len(json.dumps(tool))
 
-    estimated_tokens = max(1, total_chars // 4)
+    estimated_tokens = max(1, total_chars // 4) + total_image_tokens
 
     return JSONResponse(content={"input_tokens": estimated_tokens})
 
@@ -944,7 +1012,7 @@ async def create_message(request: Request):
                                         fn_name = fn.get("name", "")
 
                                         if tc_index not in first_tool_index_seen:
-                                            if block_started and current_block_type == "text":
+                                            if block_started:
                                                 yield _sse_event("content_block_stop", {
                                                     "type": "content_block_stop",
                                                     "index": content_index,
