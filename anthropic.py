@@ -48,16 +48,19 @@ GITHUB_API = "https://api.github.com"
 COPILOT_API = "https://api.individual.githubcopilot.com"
 
 # CLI identity — copy chính xác từ traffic capture
-CLI_VERSION = "1.0.10"
+CLI_VERSION = "1.0.24"
 _os_name = "linux" if platform.system() == "Linux" else platform.system().lower()
 _node_version = "v24.11.1"
 
 # User-Agent giống hệt CLI thật (2 dạng)
+# Format từ app.js: `${name}/${version} (${clientName}${platform} ${nodeVersion}) term/${TERM_PROGRAM}`
+# name = "@github/copilot" → akr() → "copilot"
+# clientName = "github/cli" → "client/github/cli "
 USER_AGENT = f"copilot/{CLI_VERSION} ({_os_name} {_node_version}) term/unknown"
 USER_AGENT_CHAT = f"copilot/{CLI_VERSION} (client/github/cli {_os_name} {_node_version}) term/unknown"
 
 # API version CLI dùng (KHÁC với VSCode)
-GITHUB_API_VERSION = "2025-05-01"
+GITHUB_API_VERSION = "2026-01-09"
 
 # ═══════════════════════════════════════════════════════════════
 # TIMEOUT & RETRY CONFIG
@@ -76,7 +79,7 @@ STREAM_TIMEOUT = httpx.Timeout(
 )
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2.0
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {400, 429, 500, 502, 503, 504}
 
 # ═══════════════════════════════════════════════════════════════
 # Persistent session IDs — giống CLI thật
@@ -85,26 +88,55 @@ SESSION_ID = str(uuid.uuid4())
 MACHINE_ID = hashlib.sha256(uuid.getnode().to_bytes(6, 'big')).hexdigest()
 
 # ═══════════════════════════════════════════════════════════════
+# NEW: Machine ID format UUID (như CLI thật) & Telemetry config
+# ═══════════════════════════════════════════════════════════════
+# CLI thật dùng format UUID cho X-Client-Machine-Id
+MACHINE_ID_UUID = str(uuid.UUID(int=uuid.getnode()))
+TELEMETRY_HOST = "telemetry.individual.githubcopilot.com"
+COPILOT_TRACKING_ID = hashlib.md5(MACHINE_ID_UUID.encode()).hexdigest()
+
+# X-Stainless headers — CLI thật gửi kèm mỗi request
+_arch = platform.machine()
+if _arch == "x86_64":
+    _arch = "x64"
+elif _arch == "aarch64":
+    _arch = "arm64"
+
+STAINLESS_HEADERS = {
+    "X-Stainless-Retry-Count": "0",
+    "X-Stainless-Lang": "js",
+    "X-Stainless-Package-Version": "5.20.1",
+    "X-Stainless-Os": platform.system(),
+    "X-Stainless-Arch": _arch,
+    "X-Stainless-Runtime": "node",
+    "X-Stainless-Runtime-Version": _node_version,
+}
+
+# Experiment assignment context — auto-fetched on first request (lazy init)
+EXP_ASSIGNMENT_CONTEXT = ""
+_telemetry_fetched = False  # Flag để chỉ fetch 1 lần duy nhất
+
+# ═══════════════════════════════════════════════════════════════
 # MODEL MAPPING — Claude Code sends dashes, Copilot uses dots
 # ═══════════════════════════════════════════════════════════════
 MODEL_MAP = {
     # Opus
     "claude-opus-4-6":          "claude-opus-4.6",
-    "claude-opus-4-5":          "claude-opus-4.6",
-    "claude-opus-4-0":          "claude-opus-4.6",
+    "claude-opus-4-5":          "claude-opus-4.5",
+    "claude-opus-4-0":          "claude-opus-4.5",
     # Sonnet
     "claude-sonnet-4-6":        "claude-sonnet-4.6",
-    "claude-sonnet-4-5":        "claude-sonnet-4.6",
-    "claude-sonnet-4-0":        "claude-sonnet-4.6",
-    "claude-sonnet-4":          "claude-sonnet-4.6",
+    "claude-sonnet-4-5":        "claude-sonnet-4.5",
+    "claude-sonnet-4-0":        "claude-sonnet-4",
+    "claude-sonnet-4":          "claude-sonnet-4",
     # Haiku
     "claude-haiku-4-5":         "claude-haiku-4.5",
     "claude-haiku-3-5":         "claude-haiku-4.5",
-    # Pass-through
+    # Pass-through (already correct format)
     "claude-opus-4.6":          "claude-opus-4.6",
-    "claude-opus-4.5":          "claude-opus-4.6",
+    "claude-opus-4.5":          "claude-opus-4.5",
     "claude-sonnet-4.6":        "claude-sonnet-4.6",
-    "claude-sonnet-4.5":        "claude-sonnet-4.6",
+    "claude-sonnet-4.5":        "claude-sonnet-4.5",
     "claude-haiku-4.5":         "claude-haiku-4.5",
 }
 
@@ -435,6 +467,68 @@ def truncate_messages_for_context(
 
 
 # ═══════════════════════════════════════════════════════════════
+# AUTO TELEMETRY — Tự fetch AssignmentContext ở request đầu tiên
+# Giống CLI thật: lúc startup nó GET /telemetry để lấy experiment
+# flags, rồi gửi kèm X-Copilot-Client-Exp-Assignment-Context
+# trong MỌI request sau đó.
+# ═══════════════════════════════════════════════════════════════
+
+async def _auto_fetch_telemetry(github_token: str):
+    """Lazy-init: tự động fetch experiment config từ telemetry endpoint.
+
+    Chỉ chạy 1 lần duy nhất khi có request đầu tiên (lúc đó mới có token).
+    CLI thật làm việc này lúc startup, nhưng proxy chưa có token lúc boot.
+    """
+    global EXP_ASSIGNMENT_CONTEXT, _telemetry_fetched
+
+    if _telemetry_fetched:
+        return
+
+    _telemetry_fetched = True  # Set trước để tránh race condition
+
+    print(f"\n  🔄 Auto-fetching telemetry config (first request)...")
+
+    params = {"tas-endpoint": "githubdevdiv"}
+    headers = {
+        "User-Agent": "copilot-cli",
+        "X-Exp-Sdk-Version": "1",
+        "X-Vscode-Extensionname": "CopilotCLI",
+        "X-Msedge-Clientid": str(uuid.uuid4()),
+        "X-Exp-Parameters": (
+            f"copilottrackingid={COPILOT_TRACKING_ID},"
+            f"github_copilotcli_cliversion={CLI_VERSION}.9999,"
+            "github_copilotcli_prerelease=0,"
+            "github_copilotcli_audience=external,"
+            "github_copilotcli_experimentationoptin=0,"
+            "extensionname=CopilotCLI,"
+            f"github_copilotcli_firstlaunchat={int(time.time())},"
+            "github_copilotcli_copilotplan=individual"
+        ),
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://{TELEMETRY_HOST}/telemetry",
+                params=params,
+                headers=headers,
+                timeout=10,
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                EXP_ASSIGNMENT_CONTEXT = data.get("AssignmentContext", "")
+                features = data.get("Features", [])
+                flights = data.get("Flights", {})
+                print(f"  ✅ Telemetry loaded | Context: {EXP_ASSIGNMENT_CONTEXT[:80]}...")
+                print(f"     Features: {len(features)} | Flights: {len(flights)} groups")
+            else:
+                print(f"  ⚠ Telemetry fetch failed: HTTP {resp.status_code} (non-critical, continuing)")
+    except Exception as e:
+        print(f"  ⚠ Telemetry fetch error: {e} (non-critical, continuing)")
+
+
+# ═══════════════════════════════════════════════════════════════
 # AUTH — CLI style: gho_ token dùng TRỰC TIẾP
 # KHÔNG exchange sang JWT như VSCode
 # ═══════════════════════════════════════════════════════════════
@@ -502,29 +596,87 @@ def require_auth(request: Request) -> str:
     })
 
 
-def copilot_headers(github_token: str, interaction_id: str = "", initiator: str = "user") -> dict:
-    """Build headers giả dạng Copilot CLI chính chủ.
+def copilot_headers(
+    github_token: str,
+    interaction_id: str = "",
+    initiator: str = "user",
+    interaction_type: str = "conversation-agent",
+    agent_task_id: str = "",
+    streaming: bool = False,
+) -> dict:
+    """Build headers giả dạng Copilot CLI chính chủ v1.0.24.
 
     KEY DIFFERENCE vs server-anthropic.py:
     - Dùng gho_ token trực tiếp (KHÔNG JWT)
     - Copilot-Integration-Id: copilot-developer-cli (KHÔNG vscode-chat)
     - KHÔNG có Editor-Version, Editor-Plugin-Version, VScode-*
     - User-Agent format CLI
-    - X-GitHub-Api-Version: 2025-05-01 (KHÔNG 2025-07-16)
+    - X-GitHub-Api-Version: 2026-01-09
+    - Có X-Stainless-* headers
+    - Có X-Agent-Task-Id, X-Client-Machine-Id
+    - X-Initiator: "user" (v1.0.24 baseHeaders dùng "user", không phải "agent")
+    - Runtime-Client-Version: CLI version (header mới trong v1.0.24)
     """
-    return {
+    # CLI thật dùng text/event-stream cho streaming requests
+    accept_header = "text/event-stream" if streaming else "application/json"
+
+    headers = {
         "Authorization": f"Bearer {github_token}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": accept_header,
         "User-Agent": USER_AGENT_CHAT,
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "X-Github-Api-Version": GITHUB_API_VERSION,
         "Copilot-Integration-Id": "copilot-developer-cli",
         "OpenAI-Intent": "conversation-agent",
-        "X-Initiator": "agent",
+        "X-Initiator": "agent",  # "user" in v1.0.24 baseHeaders
         "X-Interaction-Id": interaction_id or str(uuid.uuid4()),
-        "X-Interaction-Type": "conversation-user",
+        "X-Interaction-Type": interaction_type,
         "X-Client-Session-Id": SESSION_ID,
+        "X-Client-Machine-Id": MACHINE_ID_UUID,
+        "Runtime-Client-Version": CLI_VERSION,  # NEW in v1.0.24
     }
+
+    # Add X-Stainless headers (như CLI thật)
+    headers.update(STAINLESS_HEADERS)
+
+    # Add agent task ID if provided
+    if agent_task_id:
+        headers["X-Agent-Task-Id"] = agent_task_id
+
+    # Add experiment context if available
+    if EXP_ASSIGNMENT_CONTEXT:
+        headers["X-Copilot-Client-Exp-Assignment-Context"] = EXP_ASSIGNMENT_CONTEXT
+
+    return headers
+
+
+def copilot_headers_native(
+    github_token: str,
+    interaction_id: str = "",
+    interaction_type: str = "conversation-agent",
+    agent_task_id: str = "",
+    streaming: bool = False,
+    anthropic_beta: str = "",
+) -> dict:
+    """Build headers for Anthropic native /v1/messages passthrough.
+
+    Similar to copilot_headers() but also forwards anthropic-beta header
+    which is required for features like prompt caching, extended output, etc.
+    """
+    headers = copilot_headers(
+        github_token=github_token,
+        interaction_id=interaction_id,
+        interaction_type=interaction_type,
+        agent_task_id=agent_task_id,
+        streaming=streaming,
+    )
+
+    # Forward anthropic-beta header if present (critical for Claude Code features)
+    # e.g. "prompt-caching-2024-07-31,pdfs-2024-09-25,output-128k-2025-02-19"
+    if anthropic_beta:
+        headers["anthropic-beta"] = anthropic_beta
+
+    return headers
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -541,6 +693,8 @@ def anthropic_to_openai_messages(anthropic_messages: list) -> list:
         content = msg.get("content")
 
         if isinstance(content, str):
+            if not content.strip():
+                content = " "
             openai_msgs.append({"role": role, "content": content})
             continue
 
@@ -575,17 +729,30 @@ def anthropic_to_openai_messages(anthropic_messages: list) -> list:
                     tool_results.append(block)
 
             if tool_results:
+                if text_parts or image_parts:
+                    parts = []
+                    if text_parts:
+                        parts.append({"type": "text", "text": "\n".join(text_parts)})
+                    parts.extend(image_parts)
+                    if len(parts) == 1 and parts[0]["type"] == "text":
+                        openai_msgs.append({"role": role, "content": parts[0]["text"]})
+                    else:
+                        openai_msgs.append({"role": role, "content": parts})
+                
                 for tr in tool_results:
                     tr_content = tr.get("content", "")
                     if isinstance(tr_content, list):
-                        tr_content = " ".join(
+                        tr_content = "\n".join(
                             b.get("text", "") for b in tr_content
                             if b.get("type") == "text"
                         )
+                    content_str = str(tr_content)
+                    if not content_str.strip():
+                        content_str = " "
                     openai_msgs.append({
                         "role": "tool",
                         "tool_call_id": tr.get("tool_use_id", ""),
-                        "content": str(tr_content),
+                        "content": content_str,
                     })
                 continue
 
@@ -614,19 +781,85 @@ def anthropic_to_openai_messages(anthropic_messages: list) -> list:
                 parts.extend(image_parts)
                 openai_msgs.append({"role": role, "content": parts})
             elif text_parts:
-                openai_msgs.append({"role": role, "content": "\n".join(text_parts)})
+                txt = "\n".join(text_parts)
+                if not txt.strip():
+                    txt = " "
+                openai_msgs.append({"role": role, "content": txt})
             else:
-                openai_msgs.append({"role": role, "content": ""})
+                openai_msgs.append({"role": role, "content": " "})
 
     return openai_msgs
 
 
+def strip_beta_fields_from_tools(tools: list) -> list:
+    """Strip experimental beta fields from tools that Copilot API rejects with 400.
+
+    Claude Code sends fields like 'strict', 'eager_input_streaming', 'defer_loading'
+    that are first-party Anthropic-only features. Copilot API does not accept these.
+
+    Also converts built-in Anthropic tools (e.g. web_search_20250305) to custom tool
+    format that Copilot accepts, and removes unsupported built-in tools.
+    """
+    if not tools:
+        return tools
+
+    # Fields that cause 400 on Copilot API (1P-only experimental fields)
+    BETA_FIELDS_TO_STRIP = {"strict", "eager_input_streaming", "defer_loading"}
+
+    # Built-in Anthropic tool types to skip entirely
+    BUILTIN_TOOL_TYPES = {
+        "bash_20250124", "text_editor_20250124", "computer_20250124",
+        "bash_20241022", "text_editor_20241022", "computer_20241022",
+    }
+
+    cleaned_tools = []
+    for tool in tools:
+        tool_type = tool.get("type", "")
+
+        # Skip known unsupported built-in tools
+        if tool_type in BUILTIN_TOOL_TYPES:
+            continue
+
+        # Convert web_search built-in tool → custom tool format
+        if isinstance(tool_type, str) and tool_type.startswith("web_search"):
+            print(f"  ↳ Converting built-in tool '{tool_type}' → custom tool 'web_search'")
+            cleaned_tools.append({
+                "name": tool.get("name", "web_search"),
+                "description": "Search the web for real-time information.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query"},
+                    },
+                    "required": ["query"],
+                },
+            })
+            continue
+
+        # Other unknown built-in tools (have "type" field that's not standard) — skip
+        if tool_type and tool_type not in ("", "custom"):
+            # Check if it looks like a built-in (has type but no name/input_schema at top level)
+            if "name" not in tool and "input_schema" not in tool:
+                print(f"  ↳ Removing unsupported built-in tool: '{tool_type}'")
+                continue
+
+        # Custom tools: strip experimental beta fields
+        cleaned_tool = {}
+        for k, v in tool.items():
+            if k not in BETA_FIELDS_TO_STRIP:
+                cleaned_tool[k] = v
+
+        cleaned_tools.append(cleaned_tool)
+
+    return cleaned_tools
+
+
 def anthropic_to_openai_tools(anthropic_tools: list) -> list:
     """Convert Anthropic tools → OpenAI tools format."""
+    # First strip beta fields, then convert
+    cleaned = strip_beta_fields_from_tools(anthropic_tools)
     openai_tools = []
-    for tool in anthropic_tools:
-        if tool.get("type") in ("bash_20250124", "text_editor_20250124", "computer_20250124"):
-            continue
+    for tool in cleaned:
         openai_tools.append({
             "type": "function",
             "function": {
@@ -640,10 +873,14 @@ def anthropic_to_openai_tools(anthropic_tools: list) -> list:
 
 def anthropic_to_openai_request(body: dict) -> dict:
     """Convert full Anthropic request body → OpenAI request body."""
+    max_tokens = body.get("max_tokens", 4096)
+    if max_tokens > 4096:
+        max_tokens = 4096
+    
     openai_body = {
         "model": resolve_model(body.get("model", "")),
         "messages": [],
-        "max_tokens": body.get("max_tokens", 4096),
+        "max_tokens": max_tokens,
     }
 
     system = body.get("system")
@@ -691,6 +928,159 @@ def anthropic_to_openai_request(body: dict) -> dict:
             openai_body["tool_choice"] = "none"
 
     return openai_body
+
+
+# ═══════════════════════════════════════════════════════════════
+# ANTHROPIC NATIVE PASSTHROUGH — Gửi trực tiếp format Anthropic
+# tới /v1/messages trên Copilot API (không cần convert OpenAI)
+# ═══════════════════════════════════════════════════════════════
+
+# Date suffix regex for stripping (e.g. claude-sonnet-4-20250414 → claude-sonnet-4)
+_DATE_SUFFIX_STRIP_RE = re.compile(r"^(claude-[\w.]+-[\d]+(?:[.-][\d]+)*)-\d{8,}$")
+
+
+def _strip_model_date_suffix(model: str) -> str:
+    """Strip date suffix from model name for Copilot API compatibility.
+    e.g. claude-sonnet-4-20250414 → claude-sonnet-4
+    """
+    m = _DATE_SUFFIX_STRIP_RE.match(model.strip())
+    return m.group(1) if m else model.strip()
+
+
+def is_claude_model(model: str) -> bool:
+    """Check if model is a Claude model (supports /v1/messages native endpoint)."""
+    stripped = _strip_model_date_suffix(model)
+    return stripped.startswith("claude-")
+
+
+_ALLOWED_IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_MEDIA_TYPE_ALIASES = {
+    # Common MIME types that Copilot API rejects — map to closest allowed type
+    "image/jpg": "image/jpeg",
+    "image/jpe": "image/jpeg",
+    "image/pjpeg": "image/jpeg",
+    "image/x-png": "image/png",
+    "image/svg+xml": "image/png",
+    "image/tiff": "image/png",
+    "image/bmp": "image/png",
+    "image/avif": "image/webp",
+    "image/heic": "image/jpeg",
+    "image/heif": "image/jpeg",
+}
+
+
+def _fix_image_block(block: dict) -> dict:
+    """Fix or remove invalid media_type in a single image block."""
+    src = block.get("source", {})
+    if src.get("type") != "base64":
+        return block
+    mt = src.get("media_type", "")
+    if mt in _ALLOWED_IMAGE_MEDIA_TYPES:
+        return block
+    # Try alias mapping first
+    fixed = _MEDIA_TYPE_ALIASES.get(mt)
+    if fixed:
+        block = dict(block)
+        block["source"] = dict(src)
+        block["source"]["media_type"] = fixed
+        return block
+    # Unknown media_type → default to image/png (safest fallback)
+    block = dict(block)
+    block["source"] = dict(src)
+    block["source"]["media_type"] = "image/png"
+    return block
+
+
+def _sanitize_images_in_content(content) -> tuple:
+    """Recursively sanitize image media_types in a content block list or string.
+
+    Returns (new_content, changed: bool).
+    """
+    if not isinstance(content, list):
+        return content, False
+    new_content = []
+    changed = False
+    for block in content:
+        btype = block.get("type", "")
+        if btype == "image":
+            fixed = _fix_image_block(block)
+            if fixed is not block:
+                changed = True
+            new_content.append(fixed)
+        elif btype == "tool_result":
+            inner, inner_changed = _sanitize_images_in_content(block.get("content", ""))
+            if inner_changed:
+                block = dict(block)
+                block["content"] = inner
+                changed = True
+            new_content.append(block)
+        else:
+            new_content.append(block)
+    return new_content, changed
+
+
+def _sanitize_messages_images(messages: list) -> list:
+    """Walk all messages and fix any invalid image media_types in-place (returns new list)."""
+    result = []
+    for msg in messages:
+        content = msg.get("content")
+        new_content, changed = _sanitize_images_in_content(content)
+        if changed:
+            msg = dict(msg)
+            msg["content"] = new_content
+        result.append(msg)
+    return result
+
+
+def build_passthrough_payload(body: dict) -> dict:
+    """Build clean Anthropic payload for native /v1/messages passthrough.
+
+    Only includes known Anthropic API fields, strips beta fields from tools,
+    removes unknown top-level fields that Copilot may reject.
+    Sanitizes image media_types to only allowed values.
+    """
+    model = _strip_model_date_suffix(body.get("model", ""))
+    # Also apply MODEL_MAP for dash→dot conversion
+    model = resolve_model(model)
+
+    # Sanitize image media_types — Copilot only accepts jpeg/png/gif/webp
+    messages = _sanitize_messages_images(body.get("messages", []))
+
+    out = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": body.get("max_tokens", 4096),
+    }
+
+    # Stream
+    if body.get("stream") is not None:
+        out["stream"] = body["stream"]
+
+    # Optional standard Anthropic fields — only include if present
+    if body.get("system") is not None:
+        out["system"] = body["system"]
+    if body.get("metadata") is not None:
+        out["metadata"] = body["metadata"]
+    if body.get("stop_sequences") is not None:
+        out["stop_sequences"] = body["stop_sequences"]
+    if body.get("temperature") is not None:
+        out["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        out["top_p"] = body["top_p"]
+    if body.get("top_k") is not None:
+        out["top_k"] = body["top_k"]
+    if body.get("tool_choice") is not None:
+        out["tool_choice"] = body["tool_choice"]
+    if body.get("thinking") is not None:
+        out["thinking"] = body["thinking"]
+    if body.get("service_tier") is not None:
+        out["service_tier"] = body["service_tier"]
+
+    # Strip beta fields from tools
+    if body.get("tools") is not None:
+        out["tools"] = strip_beta_fields_from_tools(body["tools"])
+
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -841,6 +1231,412 @@ async def count_tokens(request: Request):
 
 
 # ═══════════════════════════════════════════════════════════════
+# TELEMETRY — Giả dạng Copilot CLI telemetry (Full Clone)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/internal/telemetry")
+async def get_telemetry_config(request: Request):
+    """Proxy GET telemetry request to GitHub, parse experiment config.
+
+    CLI thật gọi endpoint này lúc startup để lấy:
+    - Features/Flights (A/B testing flags)
+    - AssignmentContext (được gửi kèm trong mỗi request sau đó)
+    """
+    global EXP_ASSIGNMENT_CONTEXT
+
+    github_token = require_auth(request)
+
+    params = {"tas-endpoint": "githubdevdiv"}
+    headers = {
+        "User-Agent": "copilot-cli",
+        "X-Exp-Sdk-Version": "1",
+        "X-Vscode-Extensionname": "CopilotCLI",
+        "X-Msedge-Clientid": str(uuid.uuid4()),
+        "X-Exp-Parameters": (
+            f"copilottrackingid={COPILOT_TRACKING_ID},"
+            f"github_copilotcli_cliversion={CLI_VERSION}.9999,"
+            "github_copilotcli_prerelease=0,"
+            "github_copilotcli_audience=external,"
+            "github_copilotcli_experimentationoptin=0,"
+            "extensionname=CopilotCLI,"
+            f"github_copilotcli_firstlaunchat={int(time.time())},"
+            "github_copilotcli_copilotplan=individual"
+        ),
+    }
+
+    print(f"\n  ↳ GET /internal/telemetry → {TELEMETRY_HOST}")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://{TELEMETRY_HOST}/telemetry",
+                params=params,
+                headers=headers,
+                timeout=15,
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                EXP_ASSIGNMENT_CONTEXT = data.get("AssignmentContext", "")
+                print(f"  ✓ Telemetry config loaded | AssignmentContext: {EXP_ASSIGNMENT_CONTEXT[:50]}...")
+                return JSONResponse(content=data)
+
+            print(f"  ✗ Telemetry GET failed: HTTP {resp.status_code}")
+            return JSONResponse(
+                status_code=resp.status_code,
+                content={"error": resp.text[:500]}
+            )
+    except Exception as e:
+        print(f"  ✗ Telemetry GET error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/internal/telemetry")
+async def post_telemetry(request: Request):
+    """Proxy POST telemetry (metrics) to GitHub.
+
+    CLI thật gửi telemetry events ở background (gzip compressed).
+    Format: application/x-json-stream
+    """
+    body = await request.body()
+
+    headers = {
+        "Content-Type": "application/x-json-stream",
+        "Content-Encoding": "gzip",
+        "User-Agent": "undici",
+    }
+
+    print(f"\n  ↳ POST /internal/telemetry → {TELEMETRY_HOST} ({len(body)} bytes)")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://{TELEMETRY_HOST}/telemetry",
+                content=body,
+                headers=headers,
+                timeout=15,
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                print(f"  ✓ Telemetry POST OK | itemsAccepted: {data.get('itemsAccepted', 'N/A')}")
+                return JSONResponse(content=data)
+
+            print(f"  ✗ Telemetry POST failed: HTTP {resp.status_code}")
+            return JSONResponse(
+                status_code=resp.status_code,
+                content={"error": resp.text[:200]}
+            )
+    except Exception as e:
+        print(f"  ✗ Telemetry POST error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════
+# RESPONSES — OpenAI Responses API (gpt-5-mini cho session titles)
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/internal/responses")
+async def create_response(request: Request):
+    """Proxy to /responses endpoint (gpt-5-mini for session titles).
+
+    CLI thật dùng endpoint này để generate session title ở background.
+    Request format là OpenAI Responses API (khác với Chat Completions).
+    """
+    github_token = require_auth(request)
+    await ensure_valid_token(github_token)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail={
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "Invalid JSON body"}
+        })
+
+    interaction_id = str(uuid.uuid4())
+    agent_task_id = str(uuid.uuid4())
+
+    headers = copilot_headers(
+        github_token,
+        interaction_id=interaction_id,
+        interaction_type="conversation-background",  # Background task for session title
+        agent_task_id=agent_task_id,
+    )
+
+    url = f"{COPILOT_API}/responses"
+    model = body.get("model", "gpt-5-mini")
+
+    print(f"\n  ↳ POST /internal/responses → {url}")
+    print(f"  ↳ Model: {model} | Task: {agent_task_id[:8]}...")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=UPSTREAM_TIMEOUT,
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                print(f"  ✓ Responses OK | status: {data.get('status', 'N/A')}")
+                return JSONResponse(content=data)
+
+            err_text = resp.text[:500]
+            print(f"  ✗ Responses failed: HTTP {resp.status_code}: {err_text}")
+            return JSONResponse(
+                status_code=resp.status_code,
+                content={"error": err_text}
+            )
+    except Exception as e:
+        print(f"  ✗ Responses error: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════
+# HELPER: OpenAI Stream Generator (used by both main path & native fallback)
+# ═══════════════════════════════════════════════════════════════
+
+async def _generate_openai_stream(body: dict, github_token: str, model_requested: str):
+    """Generate Anthropic SSE events from OpenAI /chat/completions stream.
+
+    This is extracted as a helper so it can be called both from the main OpenAI path
+    and as a fallback when /v1/messages rejects the model.
+    """
+    openai_body = anthropic_to_openai_request(body)
+    # Force streaming
+    openai_body["stream"] = True
+    openai_body["stream_options"] = {"include_usage": True}
+
+    interaction_id = str(uuid.uuid4())
+    agent_task_id = str(uuid.uuid4())
+    _headers = copilot_headers(
+        github_token,
+        interaction_id=interaction_id,
+        interaction_type="conversation-agent",
+        agent_task_id=agent_task_id,
+        streaming=True,
+    )
+    _url = f"{COPILOT_API}/chat/completions"
+
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    content_index = 0
+    current_block_type = None
+    block_started = False
+    tool_call_buffers: Dict[int, dict] = {}
+    usage_data = {"input_tokens": 0, "output_tokens": 0}
+    stop_reason = "end_turn"
+    first_text = True
+    first_tool_index_seen: Dict[int, bool] = {}
+
+    for stream_attempt in range(1, MAX_RETRIES + 1):
+        # Reset state for each attempt
+        content_index = 0
+        current_block_type = None
+        block_started = False
+        tool_call_buffers = {}
+        usage_data = {"input_tokens": 0, "output_tokens": 0}
+        stop_reason = "end_turn"
+        first_text = True
+        first_tool_index_seen = {}
+
+        async with httpx.AsyncClient() as client:
+            try:
+                async with client.stream("POST", _url, headers=_headers, json=openai_body, timeout=STREAM_TIMEOUT) as resp:
+                    if resp.status_code != 200:
+                        err_bytes = await resp.aread()
+                        err_msg = err_bytes.decode("utf-8", errors="replace")[:500]
+                        if resp.status_code in RETRYABLE_STATUS_CODES and stream_attempt < MAX_RETRIES:
+                            delay = RETRY_BASE_DELAY * (2 ** (stream_attempt - 1))
+                            print(f"  ⚠ OpenAI stream attempt {stream_attempt}/{MAX_RETRIES} got HTTP {resp.status_code}: {err_msg}")
+                            print(f"    Retrying in {delay:.0f}s...")
+                            await asyncio.sleep(delay)
+                            _headers = copilot_headers(
+                                github_token,
+                                interaction_id=str(uuid.uuid4()),
+                                interaction_type="conversation-agent",
+                                agent_task_id=str(uuid.uuid4()),
+                                streaming=True,
+                            )
+                            continue
+                        print(f"  ✗ OpenAI upstream error HTTP {resp.status_code}: {err_msg}")
+                        yield _sse_event("error", {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": f"Upstream error {resp.status_code}: {err_msg}",
+                            }
+                        })
+                        return
+
+                    # Emit message_start
+                    yield _sse_event("message_start", {
+                        "type": "message_start",
+                        "message": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "model": model_requested,
+                            "content": [],
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        }
+                    })
+
+                    buf = ""
+                    async for raw_bytes in resp.aiter_bytes():
+                        if not raw_bytes:
+                            continue
+                        buf += raw_bytes.decode("utf-8", errors="replace")
+
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if not line or not line.startswith("data: "):
+                                continue
+                            payload = line[6:]
+                            if payload.strip() == "[DONE]":
+                                break
+
+                            try:
+                                chunk = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+
+                            if "usage" in chunk and chunk["usage"]:
+                                u = chunk["usage"]
+                                usage_data["input_tokens"] = u.get("prompt_tokens", 0)
+                                usage_data["output_tokens"] = u.get("completion_tokens", 0)
+
+                            choices = chunk.get("choices", [])
+                            if not choices:
+                                continue
+
+                            c = choices[0]
+                            delta = c.get("delta", {})
+                            finish = c.get("finish_reason")
+
+                            # Text content
+                            text_content = delta.get("content")
+                            if text_content is not None:
+                                if first_text:
+                                    yield _sse_event("content_block_start", {
+                                        "type": "content_block_start",
+                                        "index": content_index,
+                                        "content_block": {"type": "text", "text": ""},
+                                    })
+                                    first_text = False
+                                    current_block_type = "text"
+                                    block_started = True
+                                if text_content:
+                                    yield _sse_event("content_block_delta", {
+                                        "type": "content_block_delta",
+                                        "index": content_index,
+                                        "delta": {"type": "text_delta", "text": text_content},
+                                    })
+
+                            # Tool calls
+                            if "tool_calls" in delta:
+                                for tc in delta["tool_calls"]:
+                                    tc_index = tc.get("index", 0)
+                                    fn = tc.get("function", {})
+                                    fn_name = fn.get("name", "")
+
+                                    if tc_index not in first_tool_index_seen:
+                                        if block_started:
+                                            yield _sse_event("content_block_stop", {
+                                                "type": "content_block_stop",
+                                                "index": content_index,
+                                            })
+                                            content_index += 1
+
+                                        first_tool_index_seen[tc_index] = True
+                                        tool_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
+                                        tool_call_buffers[tc_index] = {
+                                            "id": tool_id,
+                                            "name": fn_name,
+                                            "arguments_json": "",
+                                        }
+                                        yield _sse_event("content_block_start", {
+                                            "type": "content_block_start",
+                                            "index": content_index,
+                                            "content_block": {
+                                                "type": "tool_use",
+                                                "id": tool_id,
+                                                "name": fn_name,
+                                                "input": {},
+                                            },
+                                        })
+                                        current_block_type = "tool_use"
+                                        block_started = True
+
+                                    args_chunk = fn.get("arguments", "")
+                                    if args_chunk and tc_index in tool_call_buffers:
+                                        tool_call_buffers[tc_index]["arguments_json"] += args_chunk
+                                        yield _sse_event("content_block_delta", {
+                                            "type": "content_block_delta",
+                                            "index": content_index,
+                                            "delta": {
+                                                "type": "input_json_delta",
+                                                "partial_json": args_chunk,
+                                            },
+                                        })
+
+                            # Finish reason
+                            if finish:
+                                if finish == "tool_calls" and not first_tool_index_seen:
+                                    finish = "stop"
+                                stop_reason = _openai_stop_to_anthropic(finish)
+
+                    # Close any open blocks
+                    if block_started:
+                        yield _sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": content_index,
+                        })
+
+                    # message_delta
+                    yield _sse_event("message_delta", {
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": stop_reason,
+                            "stop_sequence": None,
+                        },
+                        "usage": {"output_tokens": usage_data["output_tokens"]},
+                    })
+
+                    # message_stop
+                    yield _sse_event("message_stop", {"type": "message_stop"})
+                    print(f"  ✓ OpenAI stream complete | stop_reason: {stop_reason} | usage: in={usage_data['input_tokens']} out={usage_data['output_tokens']}")
+                    return
+
+            except httpx.ReadTimeout:
+                print(f"  ✗ OpenAI stream timeout")
+                yield _sse_event("error", {
+                    "type": "error",
+                    "error": {"type": "overloaded_error", "message": "Upstream timeout. Please retry."}
+                })
+                return
+            except (httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                print(f"  ✗ OpenAI connection timeout: {type(e).__name__}")
+                yield _sse_event("error", {
+                    "type": "error",
+                    "error": {"type": "overloaded_error", "message": f"Connection timeout: {type(e).__name__}. Please retry."}
+                })
+                return
+            except httpx.HTTPError as e:
+                print(f"  ✗ OpenAI HTTP error: {e}")
+                yield _sse_event("error", {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": f"Upstream error: {e}"}
+                })
+                return
+
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN ENDPOINT — /v1/messages
 # ═══════════════════════════════════════════════════════════════
 @app.post("/v1/messages")
@@ -850,6 +1646,11 @@ async def create_message(request: Request):
 
     github_token = require_auth(request)
     await ensure_valid_token(github_token)
+
+    # ═══ Auto-fetch telemetry ở request đầu tiên (lazy init) ═══
+    # CLI thật GET /telemetry lúc startup, nhưng proxy chưa có token lúc boot
+    # nên ta fetch lần đầu ở đây. AssignmentContext sẽ được gửi kèm mọi request.
+    await _auto_fetch_telemetry(github_token)
 
     try:
         body = await request.json()
@@ -891,216 +1692,248 @@ async def create_message(request: Request):
         if trunc_stats.get("dropped_messages"):
             print(f"  ⚡ Dropped {trunc_stats['dropped_messages']} old messages")
 
-    # Convert Anthropic → OpenAI
-    openai_body = anthropic_to_openai_request(body)
+    # ═══════════════════════════════════════════════════════════
+    # ROUTE: Anthropic Native Passthrough vs OpenAI Translation
+    # ═══════════════════════════════════════════════════════════
+    # Claude models → /v1/messages (native Anthropic format, no conversion)
+    # Non-Claude models → /chat/completions (OpenAI translation)
+    use_native_passthrough = is_claude_model(model_requested)
+
+    # Extract anthropic-beta header from incoming request (for passthrough)
+    anthropic_beta = request.headers.get("anthropic-beta", "")
 
     # Log
     if resolved != model_requested:
         print(f"\n  ↳ Model mapped: {model_requested} → {resolved}")
     else:
         print(f"\n  ↳ Model: {resolved}")
-    print(f"  ↳ Identity: copilot-developer-cli | Stream: {is_stream} | max_tokens: {body.get('max_tokens', 'N/A')} | messages: {len(body.get('messages', []))} | prompt_limit: {max_prompt:,}")
+    route_label = "NATIVE /v1/messages" if use_native_passthrough else "OPENAI /chat/completions"
+    print(f"  ↳ Identity: copilot-developer-cli | Route: {route_label} | Stream: {is_stream} | max_tokens: {body.get('max_tokens', 'N/A')} | messages: {len(body.get('messages', []))} | prompt_limit: {max_prompt:,}")
+    if anthropic_beta:
+        print(f"  ↳ anthropic-beta: {anthropic_beta}")
 
-    # Build CLI-style headers — gho_ token trực tiếp, KHÔNG JWT
+    # Build CLI-style headers
     interaction_id = str(uuid.uuid4())
-    headers = copilot_headers(github_token, interaction_id=interaction_id)
-    url = f"{COPILOT_API}/chat/completions"
+    agent_task_id = str(uuid.uuid4())
 
-    if is_stream:
-        async def generate():
-            """Convert OpenAI SSE stream → Anthropic SSE stream."""
-            msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-            content_index = 0
-            current_block_type = None
-            block_started = False
-            tool_call_buffers: Dict[int, dict] = {}
-            usage_data = {"input_tokens": 0, "output_tokens": 0}
-            stop_reason = "end_turn"
-            first_text = True
-            first_tool_index_seen: Dict[int, bool] = {}
+    if use_native_passthrough:
+        # ═══════════════════════════════════════════════════════
+        # PATH A: Anthropic Native Passthrough (/v1/messages)
+        # Gửi trực tiếp format Anthropic, không cần convert OpenAI
+        # ═══════════════════════════════════════════════════════
+        passthrough_body = build_passthrough_payload(body)
+        url = f"{COPILOT_API}/v1/messages"
 
-            async with httpx.AsyncClient() as client:
-                try:
-                    async with client.stream("POST", url, headers=headers, json=openai_body, timeout=STREAM_TIMEOUT) as resp:
-                        if resp.status_code != 200:
-                            err_bytes = await resp.aread()
-                            err_msg = err_bytes.decode("utf-8", errors="replace")[:500]
-                            print(f"  ✗ Upstream error (stream) HTTP {resp.status_code}: {err_msg}")
+        headers = copilot_headers_native(
+            github_token,
+            interaction_id=interaction_id,
+            interaction_type="conversation-agent",
+            agent_task_id=agent_task_id,
+            streaming=is_stream,
+            anthropic_beta=anthropic_beta,
+        )
+
+        if is_stream:
+            async def generate_native():
+                """Stream Anthropic SSE directly from Copilot /v1/messages (passthrough)."""
+                _headers = dict(headers)
+
+                for stream_attempt in range(1, MAX_RETRIES + 1):
+                    async with httpx.AsyncClient() as client:
+                        try:
+                            async with client.stream("POST", url, headers=_headers, json=passthrough_body, timeout=STREAM_TIMEOUT) as resp:
+                                if resp.status_code != 200:
+                                    err_bytes = await resp.aread()
+                                    err_msg = err_bytes.decode("utf-8", errors="replace")[:500]
+
+                                    # If /v1/messages returns 400 with "model is not supported",
+                                    # fall back to OpenAI translation path
+                                    if resp.status_code == 400 and "model is not supported" in err_msg.lower():
+                                        print(f"  ⚠ /v1/messages rejected model '{resolved}' (400: model not supported)")
+                                        print(f"  ↳ Falling back to /chat/completions translation path...")
+                                        # Fall through to OpenAI path below
+                                        async for event in _generate_openai_stream(body, github_token, model_requested):
+                                            yield event
+                                        return
+
+                                    if resp.status_code in RETRYABLE_STATUS_CODES and stream_attempt < MAX_RETRIES:
+                                        delay = RETRY_BASE_DELAY * (2 ** (stream_attempt - 1))
+                                        print(f"  ⚠ Native stream attempt {stream_attempt}/{MAX_RETRIES} got HTTP {resp.status_code}: {err_msg}")
+                                        print(f"    Retrying in {delay:.0f}s...")
+                                        await asyncio.sleep(delay)
+                                        _headers = copilot_headers_native(
+                                            github_token,
+                                            interaction_id=str(uuid.uuid4()),
+                                            interaction_type="conversation-agent",
+                                            agent_task_id=str(uuid.uuid4()),
+                                            streaming=True,
+                                            anthropic_beta=anthropic_beta,
+                                        )
+                                        continue  # retry
+                                    print(f"  ✗ Native upstream error HTTP {resp.status_code}: {err_msg}")
+                                    yield _sse_event("error", {
+                                        "type": "error",
+                                        "error": {
+                                            "type": "api_error",
+                                            "message": f"Upstream error {resp.status_code}: {err_msg}",
+                                        }
+                                    })
+                                    return
+
+                                # Success — pipe SSE events directly (passthrough)
+                                buf = ""
+                                async for raw_bytes in resp.aiter_bytes():
+                                    if not raw_bytes:
+                                        continue
+                                    chunk = raw_bytes.decode("utf-8", errors="replace")
+                                    # Pass through directly — already Anthropic SSE format
+                                    yield chunk
+
+                                print(f"  ✓ Native stream complete (passthrough)")
+                                return  # Done
+
+                        except httpx.ReadTimeout:
+                            print(f"  ✗ Native stream timeout")
                             yield _sse_event("error", {
                                 "type": "error",
-                                "error": {
-                                    "type": "api_error",
-                                    "message": f"Upstream error {resp.status_code}: {err_msg}",
-                                }
+                                "error": {"type": "overloaded_error", "message": "Upstream timeout (native stream). Please retry."}
+                            })
+                            return
+                        except (httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                            print(f"  ✗ Native connection timeout: {type(e).__name__}")
+                            yield _sse_event("error", {
+                                "type": "error",
+                                "error": {"type": "overloaded_error", "message": f"Upstream connection timeout: {type(e).__name__}. Please retry."}
+                            })
+                            return
+                        except httpx.HTTPError as e:
+                            print(f"  ✗ Native HTTP error: {e}")
+                            yield _sse_event("error", {
+                                "type": "error",
+                                "error": {"type": "api_error", "message": f"Upstream error: {e}"}
                             })
                             return
 
-                        # Emit message_start
-                        yield _sse_event("message_start", {
-                            "type": "message_start",
-                            "message": {
-                                "id": msg_id,
-                                "type": "message",
-                                "role": "assistant",
-                                "model": model_requested,
-                                "content": [],
-                                "stop_reason": None,
-                                "stop_sequence": None,
-                                "usage": {"input_tokens": 0, "output_tokens": 0},
-                            }
+            return StreamingResponse(
+                generate_native(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        else:
+            # Non-streaming native passthrough
+            last_err = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.post(
+                            url,
+                            headers=headers,
+                            json=passthrough_body,
+                            timeout=UPSTREAM_TIMEOUT,
+                        )
+
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            usage = data.get("usage", {})
+                            print(f"  ✓ Native non-stream OK | stop_reason: {data.get('stop_reason')} | usage: in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}")
+                            return JSONResponse(
+                                content=data,
+                                headers={"anthropic-version": "2023-06-01"},
+                            )
+
+                        err_msg = resp.text[:500]
+
+                        # Fallback to OpenAI if model not supported
+                        if resp.status_code == 400 and "model is not supported" in err_msg.lower():
+                            print(f"  ⚠ /v1/messages rejected model '{resolved}'. Falling back to /chat/completions...")
+                            break  # Fall through to OpenAI path
+
+                        if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                            print(f"  ⚠ Native attempt {attempt}/{MAX_RETRIES} got HTTP {resp.status_code}: {err_msg}")
+                            await asyncio.sleep(delay)
+                            headers = copilot_headers_native(
+                                github_token,
+                                interaction_id=str(uuid.uuid4()),
+                                interaction_type="conversation-agent",
+                                agent_task_id=str(uuid.uuid4()),
+                                streaming=False,
+                                anthropic_beta=anthropic_beta,
+                            )
+                            continue
+
+                        print(f"  ✗ Native upstream error HTTP {resp.status_code}: {err_msg}")
+                        raise HTTPException(status_code=resp.status_code, detail={
+                            "type": "error",
+                            "error": {"type": "api_error", "message": err_msg}
                         })
 
-                        buf = ""
-                        async for raw_bytes in resp.aiter_bytes():
-                            if not raw_bytes:
-                                continue
-                            buf += raw_bytes.decode("utf-8", errors="replace")
-
-                            while "\n" in buf:
-                                line, buf = buf.split("\n", 1)
-                                line = line.strip()
-                                if not line or not line.startswith("data: "):
-                                    continue
-                                payload = line[6:]
-                                if payload.strip() == "[DONE]":
-                                    break
-
-                                try:
-                                    chunk = json.loads(payload)
-                                except json.JSONDecodeError:
-                                    continue
-
-                                # Extract usage
-                                if "usage" in chunk and chunk["usage"]:
-                                    u = chunk["usage"]
-                                    usage_data["input_tokens"] = u.get("prompt_tokens", 0)
-                                    usage_data["output_tokens"] = u.get("completion_tokens", 0)
-
-                                choices = chunk.get("choices", [])
-                                if not choices:
-                                    continue
-
-                                c = choices[0]
-                                delta = c.get("delta", {})
-                                finish = c.get("finish_reason")
-
-                                # ─── Text content ───
-                                text_content = delta.get("content")
-                                if text_content is not None:
-                                    if first_text:
-                                        yield _sse_event("content_block_start", {
-                                            "type": "content_block_start",
-                                            "index": content_index,
-                                            "content_block": {"type": "text", "text": ""},
-                                        })
-                                        first_text = False
-                                        current_block_type = "text"
-                                        block_started = True
-
-                                    if text_content:
-                                        yield _sse_event("content_block_delta", {
-                                            "type": "content_block_delta",
-                                            "index": content_index,
-                                            "delta": {"type": "text_delta", "text": text_content},
-                                        })
-
-                                # ─── Tool calls ───
-                                if "tool_calls" in delta:
-                                    for tc in delta["tool_calls"]:
-                                        tc_index = tc.get("index", 0)
-                                        fn = tc.get("function", {})
-                                        fn_name = fn.get("name", "")
-
-                                        if tc_index not in first_tool_index_seen:
-                                            if block_started:
-                                                yield _sse_event("content_block_stop", {
-                                                    "type": "content_block_stop",
-                                                    "index": content_index,
-                                                })
-                                                content_index += 1
-
-                                            first_tool_index_seen[tc_index] = True
-                                            tool_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
-                                            tool_call_buffers[tc_index] = {
-                                                "id": tool_id,
-                                                "name": fn_name,
-                                                "arguments_json": "",
-                                            }
-
-                                            yield _sse_event("content_block_start", {
-                                                "type": "content_block_start",
-                                                "index": content_index,
-                                                "content_block": {
-                                                    "type": "tool_use",
-                                                    "id": tool_id,
-                                                    "name": fn_name,
-                                                    "input": {},
-                                                },
-                                            })
-                                            current_block_type = "tool_use"
-                                            block_started = True
-
-                                        args_chunk = fn.get("arguments", "")
-                                        if args_chunk and tc_index in tool_call_buffers:
-                                            tool_call_buffers[tc_index]["arguments_json"] += args_chunk
-                                            yield _sse_event("content_block_delta", {
-                                                "type": "content_block_delta",
-                                                "index": content_index,
-                                                "delta": {
-                                                    "type": "input_json_delta",
-                                                    "partial_json": args_chunk,
-                                                },
-                                            })
-
-                                # ─── Finish reason ───
-                                if finish:
-                                    if finish == "tool_calls":
-                                        if not first_tool_index_seen:
-                                            finish = "stop"
-                                    stop_reason = _openai_stop_to_anthropic(finish)
-
-                        # ─── Close any open blocks ───
-                        if block_started:
-                            yield _sse_event("content_block_stop", {
-                                "type": "content_block_stop",
-                                "index": content_index,
-                            })
-
-                        # ─── message_delta ───
-                        yield _sse_event("message_delta", {
-                            "type": "message_delta",
-                            "delta": {
-                                "stop_reason": stop_reason,
-                                "stop_sequence": None,
-                            },
-                            "usage": {"output_tokens": usage_data["output_tokens"]},
-                        })
-
-                        # ─── message_stop ───
-                        yield _sse_event("message_stop", {"type": "message_stop"})
-                        print(f"  ✓ Stream complete | stop_reason: {stop_reason} | usage: in={usage_data['input_tokens']} out={usage_data['output_tokens']}")
-
-                except httpx.ReadTimeout:
-                    print(f"  ✗ Request timeout (stream)")
-                    yield _sse_event("error", {
-                        "type": "error",
-                        "error": {"type": "overloaded_error", "message": "Upstream server timeout (stream). The model may be overloaded — please retry."}
-                    })
-                except (httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
-                    print(f"  ✗ Connection timeout (stream): {type(e).__name__}")
-                    yield _sse_event("error", {
-                        "type": "error",
-                        "error": {"type": "overloaded_error", "message": f"Upstream connection timeout: {type(e).__name__}. Please retry."}
-                    })
+                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                    last_err = e
+                    if attempt < MAX_RETRIES:
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        print(f"  ⚠ Native attempt {attempt}/{MAX_RETRIES} {type(e).__name__}")
+                        await asyncio.sleep(delay)
+                        continue
                 except httpx.HTTPError as e:
-                    print(f"  ✗ HTTP error (stream): {e}")
-                    yield _sse_event("error", {
-                        "type": "error",
-                        "error": {"type": "api_error", "message": f"Upstream error: {e}"}
-                    })
+                    last_err = e
+                    if attempt < MAX_RETRIES:
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        print(f"  ⚠ Native attempt {attempt}/{MAX_RETRIES} HTTPError: {e}")
+                        await asyncio.sleep(delay)
+                        continue
 
+            # If we broke out (model not supported fallback), fall through to OpenAI path
+            # Otherwise all retries exhausted
+            if last_err and not (resp.status_code == 400 and "model is not supported" in resp.text[:500].lower()):
+                err_detail = str(last_err) if last_err else "Unknown error"
+                return JSONResponse(
+                    status_code=529,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "overloaded_error",
+                            "message": f"Upstream timeout after {MAX_RETRIES} retries. Detail: {err_detail}",
+                        }
+                    },
+                    headers={"anthropic-version": "2023-06-01"},
+                )
+
+            # Fall through to OpenAI translation path
+            print(f"  ↳ Falling back to OpenAI translation path (/chat/completions)...")
+            use_native_passthrough = False
+
+    # ═══════════════════════════════════════════════════════════
+    # PATH B: OpenAI Translation (/chat/completions)
+    # Used for non-Claude models OR as fallback if /v1/messages rejects
+    # ═══════════════════════════════════════════════════════════
+    if not use_native_passthrough:
+        # Rebuild everything for OpenAI path
+        pass
+
+    # Convert Anthropic → OpenAI
+    openai_body = anthropic_to_openai_request(body)
+
+    interaction_id = str(uuid.uuid4())
+    agent_task_id = str(uuid.uuid4())
+    # Non-stream requests are forced to stream upstream, so ALWAYS use streaming headers
+    headers = copilot_headers(
+        github_token,
+        interaction_id=interaction_id,
+        interaction_type="conversation-agent",
+        agent_task_id=agent_task_id,
+        streaming=True,  # Always stream upstream (non-stream path buffers the result)
+    )
+    url = f"{COPILOT_API}/chat/completions"
+
+    if is_stream:
+        # Delegate to the shared OpenAI stream generator helper
         return StreamingResponse(
-            generate(),
+            _generate_openai_stream(body, github_token, model_requested),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1109,47 +1942,129 @@ async def create_message(request: Request):
         )
 
     else:
-        # Non-streaming — with retry logic
+        # Non-streaming — FORCE stream upstream, buffer, return JSON
+        # Copilot API often rejects non-stream requests (400) for large bodies,
+        # so we always stream from upstream and assemble the response ourselves.
+        print(f"  ↳ Non-stream request → forcing upstream stream + buffering")
+
+        # Force stream in the openai body
+        openai_body["stream"] = True
+        openai_body["stream_options"] = {"include_usage": True}
+
+        # Rebuild headers with streaming=True (Accept: text/event-stream)
+        headers = copilot_headers(
+            github_token,
+            interaction_id=interaction_id,
+            interaction_type="conversation-agent",
+            agent_task_id=agent_task_id,
+            streaming=True,
+        )
+
         last_err = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with httpx.AsyncClient() as client:
-                    resp = await client.post(url, headers=headers, json=openai_body, timeout=UPSTREAM_TIMEOUT)
+                    async with client.stream("POST", url, headers=headers, json=openai_body, timeout=UPSTREAM_TIMEOUT) as resp:
+                        if resp.status_code != 200:
+                            err_bytes = await resp.aread()
+                            err_msg = err_bytes.decode("utf-8", errors="replace")[:500]
+                            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                                print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} got HTTP {resp.status_code}: {err_msg}")
+                                print(f"    Retrying in {delay:.0f}s...")
+                                await asyncio.sleep(delay)
+                                headers = copilot_headers(
+                                    github_token,
+                                    interaction_id=interaction_id,
+                                    interaction_type="conversation-agent",
+                                    agent_task_id=agent_task_id,
+                                    streaming=True,
+                                )
+                                continue
+                            print(f"  ✗ Upstream error HTTP {resp.status_code}: {err_msg}\n  [DEBUG] Payload: {json.dumps(openai_body)[:2000]}")
+                            raise HTTPException(status_code=resp.status_code, detail={
+                                "type": "error",
+                                "error": {"type": "api_error", "message": err_msg}
+                            })
 
-                if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
-                    try:
-                        err = resp.json()
-                        err_msg = err.get("error", {}).get("message", resp.text[:200])
-                    except Exception:
-                        err_msg = resp.text[:200]
-                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} got HTTP {resp.status_code}: {err_msg}")
-                    print(f"    Retrying in {delay:.0f}s...")
-                    await asyncio.sleep(delay)
-                    # Re-build headers (same token — CLI doesn't exchange)
-                    headers = copilot_headers(github_token, interaction_id=interaction_id)
-                    continue
+                        # Buffer the SSE stream and assemble OpenAI-style response
+                        collected_text = ""
+                        collected_tool_calls: Dict[int, dict] = {}
+                        finish_reason = "stop"
+                        usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                        model_resp = ""
 
-                if resp.status_code != 200:
-                    try:
-                        err = resp.json()
-                        err_msg = err.get("error", {}).get("message", resp.text[:500])
-                    except Exception:
-                        err_msg = resp.text[:500]
-                    print(f"  ✗ Upstream error HTTP {resp.status_code}: {err_msg}")
-                    raise HTTPException(status_code=resp.status_code, detail={
-                        "type": "error",
-                        "error": {"type": "api_error", "message": err_msg}
-                    })
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                raw = resp.json()
-                anthropic_resp = openai_to_anthropic_response(raw, model_requested)
-                usage = anthropic_resp.get("usage", {})
-                print(f"  ✓ Response OK (attempt {attempt}) | stop_reason: {anthropic_resp.get('stop_reason')} | usage: in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}")
-                return JSONResponse(
-                    content=anthropic_resp,
-                    headers={"anthropic-version": "2023-06-01"},
-                )
+                            if not model_resp and chunk.get("model"):
+                                model_resp = chunk["model"]
+
+                            # Usage from stream_options
+                            if chunk.get("usage"):
+                                usage_data = chunk["usage"]
+
+                            for choice in chunk.get("choices", []):
+                                delta = choice.get("delta", {})
+                                fr = choice.get("finish_reason")
+                                if fr:
+                                    finish_reason = fr
+
+                                # Text content
+                                if delta.get("content"):
+                                    collected_text += delta["content"]
+
+                                # Tool calls
+                                for tc in delta.get("tool_calls", []):
+                                    idx = tc.get("index", 0)
+                                    if idx not in collected_tool_calls:
+                                        collected_tool_calls[idx] = {
+                                            "id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                                            "type": "function",
+                                            "function": {"name": "", "arguments": ""},
+                                        }
+                                    if tc.get("id"):
+                                        collected_tool_calls[idx]["id"] = tc["id"]
+                                    fn = tc.get("function", {})
+                                    if fn.get("name"):
+                                        collected_tool_calls[idx]["function"]["name"] = fn["name"]
+                                    if fn.get("arguments"):
+                                        collected_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+                        # Build the assembled OpenAI non-stream response
+                        message = {"role": "assistant", "content": collected_text or None}
+                        if collected_tool_calls:
+                            message["tool_calls"] = [collected_tool_calls[k] for k in sorted(collected_tool_calls)]
+                        if not collected_text and not collected_tool_calls:
+                            message["content"] = ""
+
+                        assembled_resp = {
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                            "object": "chat.completion",
+                            "model": model_resp or openai_body.get("model", ""),
+                            "choices": [{
+                                "index": 0,
+                                "message": message,
+                                "finish_reason": finish_reason,
+                            }],
+                            "usage": usage_data,
+                        }
+
+                        anthropic_resp = openai_to_anthropic_response(assembled_resp, model_requested)
+                        usage = anthropic_resp.get("usage", {})
+                        print(f"  ✓ Non-stream (buffered) OK (attempt {attempt}) | stop_reason: {anthropic_resp.get('stop_reason')} | usage: in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}")
+                        return JSONResponse(
+                            content=anthropic_resp,
+                            headers={"anthropic-version": "2023-06-01"},
+                        )
 
             except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
                 last_err = e
@@ -1159,7 +2074,13 @@ async def create_message(request: Request):
                     print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} {timeout_type}: {e}")
                     print(f"    Retrying in {delay:.0f}s...")
                     await asyncio.sleep(delay)
-                    headers = copilot_headers(github_token, interaction_id=interaction_id)
+                    headers = copilot_headers(
+                        github_token,
+                        interaction_id=interaction_id,
+                        interaction_type="conversation-agent",
+                        agent_task_id=agent_task_id,
+                        streaming=True,  # Always stream upstream for non-stream path
+                    )
                     continue
                 else:
                     print(f"  ✗ All {MAX_RETRIES} attempts failed with {timeout_type}")
@@ -1171,7 +2092,13 @@ async def create_message(request: Request):
                     print(f"  ⚠ Attempt {attempt}/{MAX_RETRIES} HTTPError: {e}")
                     print(f"    Retrying in {delay:.0f}s...")
                     await asyncio.sleep(delay)
-                    headers = copilot_headers(github_token, interaction_id=interaction_id)
+                    headers = copilot_headers(
+                        github_token,
+                        interaction_id=interaction_id,
+                        interaction_type="conversation-agent",
+                        agent_task_id=agent_task_id,
+                        streaming=True,  # Always stream upstream for non-stream path
+                    )
                     continue
                 else:
                     print(f"  ✗ All {MAX_RETRIES} attempts failed with HTTPError: {e}")
@@ -1196,20 +2123,37 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 5005))
     print(f"""
-╔══════════════════════════════════════════════════════╗
-║  GitHub Copilot Proxy — CLI Identity                 ║
-║  http://127.0.0.1:{port}{' ' * (39 - len(str(port)))}║
-╠══════════════════════════════════════════════════════╣
-║  Identity: copilot-developer-cli (NOT vscode)        ║
-║  Auth: gho_ token direct (NO JWT exchange)           ║
-║  API Version: {GITHUB_API_VERSION}{' ' * (39 - len(GITHUB_API_VERSION))}║
-║  User-Agent: {USER_AGENT_CHAT[:39]}{' ' * max(0, 39 - len(USER_AGENT_CHAT[:39]))}║
-╠══════════════════════════════════════════════════════╣
-║  POST /v1/messages              - Create Message     ║
-║  POST /v1/messages/count_tokens - Count Tokens       ║
-╠══════════════════════════════════════════════════════╣
-║  x-api-key: gho_xxxYOUR_GITHUB_TOKEN                ║
-║  anthropic-version: 2023-06-01                       ║
-╚══════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════╗
+║  GitHub Copilot Proxy — CLI Identity (FULL CLONE v{CLI_VERSION})      ║
+║  http://127.0.0.1:{port}{' ' * (48 - len(str(port)))}║
+╠═══════════════════════════════════════════════════════════════╣
+║  📌 Cloned from Burp Capture: 2026-04-08                      ║
+║  🎯 Identity: copilot-developer-cli                           ║
+║  🔑 Auth: gho_ token direct (NO JWT exchange)                 ║
+║  📅 API Version: {GITHUB_API_VERSION}                                      ║
+║  💻 Machine-Id: {MACHINE_ID[:24]}...                 ║
+╠═══════════════════════════════════════════════════════════════╣
+║  ROUTING:                                                     ║
+║  ├─ Claude models → /v1/messages (Native Anthropic passthru)  ║
+║  └─ Other models  → /chat/completions (OpenAI translation)    ║
+╠═══════════════════════════════════════════════════════════════╣
+║  ENDPOINTS (Anthropic API style):                             ║
+║  ├─ POST /v1/messages              → Chat (Claude/GPT)        ║
+║  ├─ POST /v1/messages/count_tokens → Token Count              ║
+║  ├─ GET  /internal/telemetry       → Experiment Config        ║
+║  ├─ POST /internal/telemetry       → Send Metrics             ║
+║  └─ POST /internal/responses       → Session Titles (GPT-5)   ║
+╠═══════════════════════════════════════════════════════════════╣
+║  FIXES (v1.0.24):                                             ║
+║  ├─ X-Initiator: "user" (was "agent" in ≤1.0.21)             ║
+║  ├─ Runtime-Client-Version: 1.0.24 (NEW header)              ║
+║  ├─ Strip beta fields (strict, eager_input_streaming, etc.)   ║
+║  ├─ Convert built-in tools (web_search → custom tool)         ║
+║  └─ Forward anthropic-beta header for native path             ║
+╠═══════════════════════════════════════════════════════════════╣
+║  CLIENT HEADERS:                                              ║
+║  x-api-key: gho_xxxYOUR_GITHUB_TOKEN                          ║
+║  anthropic-version: 2023-06-01                                ║
+╚═══════════════════════════════════════════════════════════════╝
 """)
     uvicorn.run(app, host="0.0.0.0", port=port)
